@@ -1,0 +1,36 @@
+# Build products and dependency caches
+target/
+.lake/
+.beam/
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+
+# Local reference checkout and proof-run artifacts
+/codex/
+/imo2026/
+/runs/
+/store/
+/pool-packages/
+*.jsonl
+*.log
+request-*.json
+response-*.json
+
+# Credentials and machine-local configuration
+.env
+.env.*
+!.env.example
+*.token
+*.pem
+*.key
+credentials.json
+.secrets/
+secrets/
+
+# Editor and operating-system files
+.DS_Store
+*.swp
+*.swo
+*~

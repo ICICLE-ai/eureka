@@ -1,0 +1,12 @@
+OpenAI Codex
+Copyright 2025 OpenAI
+
+harness/src/responses.rs adapts and reduces the event handling and retry logic
+from openai/codex at commit 402f5b6:
+  codex-rs/codex-api/src/sse/responses.rs
+  codex-rs/codex-client/src/retry.rs
+
+Upstream: https://github.com/openai/codex
+License: Apache License, Version 2.0 (see LICENSE in this directory).
+
+The full Codex reference checkout is not included in this repository.

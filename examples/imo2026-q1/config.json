@@ -1,0 +1,17 @@
+{
+    "challenge_module": "Proofs.Challenge",
+    "solution_module": "Proofs.Solution",
+    "theorem_names": [
+        "statement_a_termination",
+        "statement_a_unique_large",
+        "statement_b_invariance",
+        "terminal_value_eq_Mval",
+        "Mval_gt_one"
+    ],
+    "permitted_axioms": [
+        "propext",
+        "Quot.sound",
+        "Classical.choice"
+    ],
+    "enable_nanoda": false
+}

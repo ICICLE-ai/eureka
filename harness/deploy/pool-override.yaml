@@ -1,0 +1,7 @@
+services:
+  gateway:
+    networks: [pool, client, agents]
+networks:
+  agents:
+    name: harness-agents
+    internal: true

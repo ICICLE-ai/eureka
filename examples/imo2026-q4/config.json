@@ -1,0 +1,13 @@
+{
+    "challenge_module": "Proofs.Challenge",
+    "solution_module": "Proofs.Solution",
+    "theorem_names": [
+        "TriangleGame.main_theorem"
+    ],
+    "permitted_axioms": [
+        "propext",
+        "Quot.sound",
+        "Classical.choice"
+    ],
+    "enable_nanoda": false
+}

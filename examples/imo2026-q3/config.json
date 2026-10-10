@@ -1,0 +1,18 @@
+{
+    "challenge_module": "Proofs.Challenge",
+    "solution_module": "Proofs.Solution",
+    "theorem_names": [
+        "LiuBangXiangYu.pieceLengths_sum",
+        "LiuBangXiangYu.pieceLengths_length",
+        "LiuBangXiangYu.L_mem_Icc",
+        "LiuBangXiangYu.V_eq",
+        "LiuBangXiangYu.lower_bound",
+        "LiuBangXiangYu.upper_bound"
+    ],
+    "permitted_axioms": [
+        "propext",
+        "Quot.sound",
+        "Classical.choice"
+    ],
+    "enable_nanoda": false
+}
