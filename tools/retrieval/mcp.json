@@ -1,0 +1,5 @@
+{
+  "name": "retrieval",
+  "command": "/opt/retrieval/venv/bin/python",
+  "args": ["/opt/retrieval/server.py", "--endpoint", "http://retrieval:8000"]
+}

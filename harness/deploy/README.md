@@ -65,7 +65,8 @@ Additional stdio MCP servers can be configured with repeated `--mcp server.json`
 
 The command and its files must be available in the sandbox image; it shares the
 sandbox's filesystem and network restrictions. Tool names are prefixed with
-`mcp_<name>_`. No retrieval server is bundled with the harness.
+`mcp_<name>_`. For local Loogle and hosted lemma search, see the optional
+[retrieval tools](../../tools/retrieval/README.md).
 
 For local integration tests (real Docker/Beam/Comparator, scripted responses,
 no provider calls), build first, then run:

@@ -1,0 +1,18 @@
+Search adapters and the Loogle subprocess protocol are adapted from
+lean-lsp-mcp, Copyright (c) 2025 Oliver Dressler, under the MIT license.
+https://github.com/oOo0oOo/lean-lsp-mcp
+Revision: f00f625810d183dbb597a3677d2d5a83b084f761
+Sources: src/lean_lsp_mcp/tools/search.py, loogle.py, search_utils.py, tool_utils.py
+Changes: separate stdio client and shared service, prebuilt Loogle, bounded
+requests, shared rate limits, explicit snapshot checks, and goal-text input.
+
+The service image also builds Loogle by Joachim Breitner, under Apache-2.0.
+https://github.com/nomeata/loogle
+Revision: 9f11169aaebf1ed1e7dcc4077f2aafe0fcf66fd0
+Its license is retained at /opt/loogle/LICENSE in the service image.
+
+Search providers:
+LeanSearch: https://github.com/frenzymath/LeanSearch
+Loogle: https://github.com/nomeata/loogle
+Lean Finder: https://huggingface.co/spaces/delta-lab-ai/Lean-Finder
+Hammer premise search: https://github.com/hanwenzhu/lean-premise-server

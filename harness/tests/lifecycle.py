@@ -143,6 +143,37 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(candidate.read_bytes(), (ROOT/'examples/simple/Proofs/Solution.lean').read_bytes())
         self.assertTrue(candidate.with_name('verification.txt').stat().st_size)
 
+    @unittest.skipUnless(os.getenv('HARNESS_RETRIEVAL_IMAGE'), 'set HARNESS_RETRIEVAL_IMAGE and start retrieval')
+    def test_retrieval_in_sandbox(self):
+        turns = 0
+        observed = []
+        def respond(body):
+            nonlocal turns
+            turns += 1
+            if turns == 1:
+                names = {t['name'] for t in body['tools']}
+                self.assertTrue({f'mcp_retrieval_{name}' for name in (
+                    'lean_local_search', 'lean_loogle', 'lean_leansearch',
+                    'lean_leanfinder', 'lean_hammer_premise')} <= names)
+                return [call('mcp_retrieval_lean_loogle', {'query': '"Nat.add_comm"', 'num_results': 2}),
+                        call('mcp_retrieval_lean_local_search', {'query': 'add_comm_nat'}),
+                        call('mcp_retrieval_lean_loogle', {'query': '"unterminated'}),
+                        call('mcp_retrieval_lean_loogle', {'query': '"Nat.mul_comm"', 'num_results': 2})]
+            observed[:] = [i['output'] for i in body['input'] if i.get('type') == 'function_call_output']
+            return [dict(type='message', role='assistant', content=[dict(type='output_text', text='search smoke complete')])]
+        self.server.respond = respond
+        result = self.run_harness('--image', os.environ['HARNESS_RETRIEVAL_IMAGE'],
+                                  '--mcp', str(ROOT/'tools/retrieval/mcp.json'))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(len(observed), 4, result.stderr)
+        self.assertIn('Nat.add_comm', observed[0])
+        self.assertIn('local-loogle', observed[0])
+        self.assertIn('add_comm_nat', observed[1])
+        self.assertTrue(observed[2].startswith('ERROR:'), observed[2])
+        self.assertIn('Nat.mul_comm', observed[3])
+        record, = self.records()
+        self.assertEqual(Path(record['candidate']).read_bytes(), (ROOT/'examples/simple/Proofs/Solution.lean').read_bytes())
+
     def test_extra_mcp_preserves_its_schema_and_arguments(self):
         server_code = """import json, sys
 for line in sys.stdin:

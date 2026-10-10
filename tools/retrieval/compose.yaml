@@ -1,0 +1,28 @@
+name: eureka-retrieval
+services:
+  retrieval:
+    image: eureka-retrieval:local
+    build:
+      context: .
+      target: service
+      args:
+        BEAM_IMAGE: ${BEAM_POOL_IMAGE:-beam-pool:local}
+    init: true
+    read_only: true
+    tmpfs: ["/tmp:rw,size=64m"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    cpus: 2
+    mem_limit: 12g
+    networks: [agents, outbound]
+    healthcheck:
+      test: [CMD, /opt/retrieval/venv/bin/python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 15s
+      timeout: 6s
+      start_period: 180s
+networks:
+  agents:
+    external: true
+    name: harness-agents
+  outbound: {}
