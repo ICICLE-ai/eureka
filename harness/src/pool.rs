@@ -40,6 +40,8 @@ pub struct PoolConfig {
     pub endpoint: String,
     /// Shared secret from `--pool-token-file`.
     pub token: String,
+    /// Limit for one attachment, from `--pool-attach-timeout-secs`.
+    pub attach_timeout: std::time::Duration,
 }
 
 impl PoolConfig {
@@ -83,7 +85,7 @@ impl PoolConfig {
             moved.push(name);
         }
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(90),
+            self.attach_timeout,
             self.attach_prepared(sandbox),
         )
         .await
