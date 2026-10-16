@@ -1,5 +1,10 @@
 //! Isolation properties of an attempt sandbox, asserted from inside it.
 //! Skips when Docker or the pool image is unavailable.
+//! Needs Docker and the beam-pool:local image, nothing else:
+//!
+//!     cargo test --locked --manifest-path harness/Cargo.toml --test sandbox -- --nocapture
+//!
+//! A skipped test still passes, so look for "skipping" in the output.
 
 use harness::sandbox::{Sandbox, SandboxSpec, WORK, prune};
 use std::os::unix::fs::MetadataExt;
@@ -55,6 +60,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // Clean up even if the test panicked before close.
         if let Ok(output) = Command::new("docker")
             .args([
                 "ps",
@@ -107,6 +113,7 @@ async fn sandbox_isolates_the_attempt() {
     assert_eq!(privs, "NoNewPrivs:\t1");
 
     let uid = std::fs::metadata(&root).unwrap().uid();
+    // The sandbox runs as our uid, so the harness can read what it writes.
     let (_, id) = sh(&sandbox, "id -u").await;
     assert_eq!(id, uid.to_string());
 
@@ -120,6 +127,7 @@ async fn sandbox_isolates_the_attempt() {
     assert_eq!(std::fs::metadata(root.join("note")).unwrap().uid(), uid);
 
     let (ok, _) = sh(&sandbox, &format!("touch {WORK}/.lake/packages/x")).await;
+    // Packages are shared by every attempt: readable, never writable.
     assert!(!ok, "packages are read-only");
     let (_, marker) = sh(&sandbox, &format!("cat {WORK}/.lake/packages/marker")).await;
     assert_eq!(marker, "ro");
@@ -145,6 +153,7 @@ async fn sandbox_isolates_the_attempt() {
 
 #[tokio::test]
 async fn prune_removes_every_container_of_a_run() {
+    // Two sandboxes dropped without close. Prune finds both, then nothing.
     let Some(f) = Fixture::new("prune") else {
         return;
     };

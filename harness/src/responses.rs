@@ -4,6 +4,10 @@
 //! and `codex-client/src/retry.rs` (Apache-2.0, commit 402f5b6), reduced to what a
 //! single-model prover needs: complete output items, usage, errors, idle timeout, retries.
 //! Items we do not interpret (reasoning) are kept verbatim so they can be sent back.
+//!
+//! Only fully received items are kept, and a retry throws away everything from
+//! the broken stream, so a half-streamed function call is never run. The
+//! endpoint must support `/responses`; `/chat/completions` won't work.
 
 use anyhow::{Context, Result, anyhow, bail};
 use eventsource_stream::Eventsource;
@@ -13,6 +17,8 @@ use serde_json::{Map, Value};
 use std::time::Duration;
 
 /// One item of the conversation, in the Responses API wire format.
+/// Fields we don't model are kept in `rest` and sent back unchanged. Reasoning
+/// items carry encrypted state the provider needs on the next turn.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Item {
@@ -83,13 +89,17 @@ impl Item {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
+    /// Includes `cached_input_tokens`.
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
+    /// Included in `output_tokens`.
     pub reasoning_tokens: u64,
 }
 
 impl Usage {
+    // Only completed responses report usage, so tokens spent on a stream that
+    // failed and was retried are not counted.
     pub fn add(&mut self, other: &Usage) {
         self.input_tokens += other.input_tokens;
         self.cached_input_tokens += other.cached_input_tokens;
@@ -106,6 +116,49 @@ pub struct Completion {
     /// items received so far are still valid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incomplete: Option<String>,
+    /// Keep the provider's terminal response intact for datasets. Some servers
+    /// put logprobs here but omit them from output_item.done. This is not replayed
+    /// into the conversation; `items` is the history used by the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<Value>,
+}
+
+impl Completion {
+    /// Check after saving the response, before executing any tools. The Responses
+    /// API exposes output-text logprobs; reasoning/tool-token coverage is not implied.
+    pub fn require_logprobs(&self) -> Result<()> {
+        let mut found = false;
+        for part in self
+            .response
+            .iter()
+            .filter_map(|r| r.get("output").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|i| i.get("content").and_then(Value::as_array))
+            .flatten()
+            .filter(|p| p.get("type").and_then(Value::as_str) == Some("output_text"))
+        {
+            if part
+                .get("text")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                continue;
+            }
+            let scores = part.get("logprobs").and_then(Value::as_array);
+            anyhow::ensure!(
+                scores.is_some_and(|s| !s.is_empty()
+                    && s.iter()
+                        .all(|t| t.get("logprob").and_then(Value::as_f64).is_some())),
+                "logprobs requested but missing or invalid for output text; use --logprobs=false only to explicitly allow unscored output"
+            );
+            found = true;
+        }
+        anyhow::ensure!(
+            found,
+            "logprobs requested but no scored output text was returned (reasoning/tool-only responses may not expose logprobs); use --logprobs=false only to explicitly allow unscored output"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -137,6 +190,7 @@ pub struct ModelConfig {
     pub model: String,
     pub effort: String,
     pub max_output_tokens: u32,
+    pub logprobs: bool,
     pub idle_timeout: Duration,
     pub max_attempts: u32,
 }
@@ -177,7 +231,10 @@ impl Client {
         tools: &[Value],
         cache_key: Option<&str>,
     ) -> Value {
-        serde_json::to_value(Request {
+        // With store=false we resend the whole history each turn, so we ask for
+        // the encrypted reasoning to include in it. The model may return several
+        // tool calls at once, but agent.rs runs them one at a time.
+        let mut body = serde_json::to_value(Request {
             model: &self.config.model,
             stream: true,
             instructions,
@@ -193,7 +250,16 @@ impl Client {
             prompt_cache_key: cache_key,
             max_output_tokens: self.config.max_output_tokens,
         })
-        .expect("request is serializable")
+        .expect("request is serializable");
+        if self.config.logprobs {
+            body["include"]
+                .as_array_mut()
+                .unwrap()
+                .push("message.output_text.logprobs".into());
+            // Zero alternatives still requests the probability of the emitted token.
+            body["top_logprobs"] = 0.into();
+        }
+        body
     }
 
     pub fn endpoint(&self) -> &str {
@@ -206,6 +272,7 @@ impl Client {
         body: &Value,
         trace: &crate::trace::Trace,
         id: &str,
+        capture: Option<&crate::trace::Trace>,
     ) -> Result<Completion> {
         let mut last = String::new();
         for attempt in 0..self.config.max_attempts {
@@ -213,11 +280,23 @@ impl Client {
                 tokio::time::sleep(backoff(attempt)).await;
             }
             trace.event(id, "request_start", serde_json::json!({"try": attempt + 1}));
-            let response =
-                match tokio::time::timeout(Duration::from_secs(1800), self.once(body)).await {
-                    Ok(result) => result,
-                    Err(_) => Ok(Attempt::Retry("request deadline exceeded".into())),
-                };
+            // The idle timeout won't catch a stream that keeps trickling, so each
+            // try is also capped at 30 minutes.
+            capture_event(
+                capture,
+                id,
+                "request",
+                serde_json::json!({"try": attempt + 1, "body": body}),
+            )?;
+            let response = match tokio::time::timeout(
+                Duration::from_secs(1800),
+                self.once(body, capture, id, attempt + 1),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Ok(Attempt::Retry("request deadline exceeded".into())),
+            };
             trace.event(id, "request_end", serde_json::json!({"try": attempt + 1, "error": response.as_ref().err().map(|e| format!("{e:#}"))}));
             match response? {
                 Attempt::Done(c) => return Ok(c),
@@ -237,7 +316,13 @@ impl Client {
         )
     }
 
-    async fn once(&self, body: &Value) -> Result<Attempt> {
+    async fn once(
+        &self,
+        body: &Value,
+        capture: Option<&crate::trace::Trace>,
+        id: &str,
+        attempt: u32,
+    ) -> Result<Attempt> {
         let url = format!("{}/responses", self.config.base_url.trim_end_matches('/'));
         let response = match self
             .http
@@ -251,12 +336,18 @@ impl Client {
             Err(e) => return Ok(Attempt::Retry(format!("transport: {e}"))),
         };
         let status = response.status();
-        if status.as_u16() == 429 || status.is_server_error() {
-            let text = response.text().await.unwrap_or_default();
-            return Ok(Attempt::Retry(format!("HTTP {status}: {text}")));
-        }
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
+            capture_event(
+                capture,
+                id,
+                "http_error",
+                serde_json::json!({"try": attempt, "status": status.as_u16(), "body": text}),
+            )?;
+            if status.as_u16() == 429 || status.is_server_error() {
+                return Ok(Attempt::Retry(format!("HTTP {status}: {text}")));
+            }
+            // Other errors (bad key, context too long) won't succeed on a retry.
             bail!("HTTP {status}: {text}");
         }
 
@@ -275,6 +366,15 @@ impl Client {
                 Ok(Some(Err(e))) => return Ok(Attempt::Retry(format!("stream: {e}"))),
                 Ok(Some(Ok(event))) => event,
             };
+            // Save before interpreting. This retains reasoning deltas, logprobs,
+            // unknown fields and partial output even if the stream is interrupted.
+            // No authorization headers are written. Each retry has its own try ID.
+            capture_event(
+                capture,
+                id,
+                "sse",
+                serde_json::json!({"try": attempt, "data": event.data}),
+            )?;
             let event: StreamEvent = match serde_json::from_str(&event.data) {
                 Ok(e) => e,
                 Err(_) => continue,
@@ -290,6 +390,9 @@ impl Client {
                     }
                 }
                 "response.completed" => {
+                    // response.status isn't checked. A server that sends
+                    // `completed` for a truncated response won't trigger the
+                    // continuation in agent.rs.
                     let usage = event
                         .response
                         .as_ref()
@@ -300,9 +403,11 @@ impl Client {
                         items,
                         usage,
                         incomplete: None,
+                        response: event.response,
                     }));
                 }
                 "response.incomplete" => {
+                    // Keep what arrived; agent.rs will ask the model to continue.
                     let reason = event
                         .response
                         .as_ref()
@@ -323,6 +428,7 @@ impl Client {
                         items,
                         usage,
                         incomplete: Some(reason),
+                        response: event.response,
                     }));
                 }
                 "response.failed" => {
@@ -335,6 +441,7 @@ impl Client {
                     return Ok(Attempt::Retry(message.to_owned()));
                 }
                 "error" => {
+                    // Remember the message in case the stream closes next.
                     failure = Some(
                         event
                             .error
@@ -351,6 +458,20 @@ impl Client {
     }
 }
 
+fn capture_event(
+    capture: Option<&crate::trace::Trace>,
+    id: &str,
+    kind: &str,
+    fields: Value,
+) -> Result<()> {
+    if let Some(capture) = capture {
+        capture.event(id, kind, fields);
+        capture.check()?; // Stop on a full disk instead of silently losing the rollout.
+    }
+    Ok(())
+}
+
+// Missing counters read as zero; some compatible servers leave out the breakdowns.
 fn parse_usage(usage: &Value) -> Usage {
     let get = |p: &str| usage.pointer(p).and_then(Value::as_u64).unwrap_or(0);
     Usage {
@@ -361,7 +482,7 @@ fn parse_usage(usage: &Value) -> Usage {
     }
 }
 
-/// Exponential backoff with jitter: 1s, 2s, 4s, ... capped at 30s.
+/// 2s, 4s, 8s, ... capped at 30s, plus up to 200ms of per-process jitter.
 fn backoff(attempt: u32) -> Duration {
     let base = 1000u64.saturating_mul(1u64 << attempt.min(5));
     let jitter = (std::process::id() as u64 ^ attempt as u64) % 200;
@@ -415,6 +536,31 @@ mod tests {
         }));
         assert_eq!(u.cached_input_tokens, 128);
         assert_eq!(u.reasoning_tokens, 22);
+    }
+
+    #[test]
+    fn requested_logprobs_must_be_present_and_numeric() {
+        let mut c = Completion {
+            items: vec![],
+            usage: Usage::default(),
+            incomplete: None,
+            response: None,
+        };
+        assert!(c.require_logprobs().is_err());
+        for scores in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!([{"logprob":null}]),
+        ] {
+            c.response = Some(
+                serde_json::json!({"output":[{"content":[{"type":"output_text","text":"hello","logprobs":scores}]}]}),
+            );
+            assert!(c.require_logprobs().is_err());
+        }
+        c.response = Some(
+            serde_json::json!({"output":[{"content":[{"type":"output_text","text":"hello","logprobs":[{"token":"hello","logprob":-0.2}]}]}]}),
+        );
+        assert!(c.require_logprobs().is_ok());
     }
 
     #[test]

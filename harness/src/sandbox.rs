@@ -1,11 +1,15 @@
 //! One hardened Docker container per attempt.
 //!
 //! The container runs Beam's pool image so the local Lean server and the
-//! pool workers share one prepared environment. It can reach the pool gateway
-//! on an internal-only network and nothing else: no internet, no host, no
-//! store, no sibling attempts. Inside, the attempt root is `/work`, writable as
-//! the harness user's uid; the prepared packages are bind-mounted read-only at
+//! pool workers share one prepared environment. It sits on an internal Docker
+//! network: no internet, but it can reach the pool gateway and anything else on
+//! that network, such as the retrieval service. The store and other attempts are
+//! not mounted. Inside, the attempt root is `/work`, writable as the harness
+//! user's uid; the prepared packages are bind-mounted read-only at
 //! `/work/.lake/packages` (Beam's attachment rejects symlinks leaving the root).
+//!
+//! Nothing is cleaned up on drop. Callers must `close` the sandbox before
+//! freezing the workspace, and `prune` removes whatever a run left behind.
 
 use anyhow::{Context, Result, bail};
 use std::os::unix::fs::MetadataExt;
@@ -25,7 +29,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 pub struct SandboxSpec {
     /// Beam's pool image; used for workers and sandboxes alike.
     pub image: String,
-    /// Internal Docker network whose only other member is the pool gateway.
+    /// Internal Docker network shared with the pool gateway.
     pub network: String,
     /// Host directory holding the image's prepared `.lake/packages`.
     pub packages: PathBuf,
@@ -60,6 +64,7 @@ impl Sandbox {
         );
 
         let mut cmd = Command::new("docker");
+        // The container only sleeps; all work goes through `docker exec`.
         cmd.args(["run", "-d", "--name", &name])
             .args(["--label", &format!("harness.run={}", spec.run_id)])
             .args(["--label", &format!("harness.attempt={attempt}")])
@@ -83,11 +88,11 @@ impl Sandbox {
             env: spec.env.clone(),
             closed: AtomicBool::new(false),
         };
-        // HOME must exist for Lean and Beam; /tmp is the only scratch space.
         if let Err(error) = started {
             let _ = sandbox.close().await;
             return Err(error);
         }
+        // HOME must exist for Lean and Beam; /tmp is the only scratch space.
         if let Err(error) = run(sandbox.command("mkdir", &["-p", HOME])).await {
             sandbox.close().await?;
             return Err(error);
@@ -101,6 +106,7 @@ impl Sandbox {
 
     /// A command executed inside the container, in `/work`, with stdio piped.
     pub fn command(&self, program: &str, args: &[&str]) -> Command {
+        // Only `env` is passed in, never the host environment.
         let mut cmd = Command::new("docker");
         cmd.args(["exec", "-i", "-w", WORK]);
         for (key, value) in &self.env {
@@ -136,16 +142,21 @@ impl Sandbox {
         let stdout = child.stdout.take().context("shell stdout")?;
         let stderr = child.stderr.take().context("shell stderr")?;
         let wait = async {
+            // Read both pipes while waiting, or a noisy command blocks on a full pipe.
             let (status, stdout, stderr) =
                 tokio::try_join!(child.wait(), bounded_read(stdout), bounded_read(stderr))?;
             Ok::<_, std::io::Error>((status, stdout, stderr))
         };
         match tokio::time::timeout(timeout + Duration::from_secs(10), wait).await {
+            // A failing command is a normal result; the model sees its exit code
+            // (137 after a timeout).
             Ok(Ok((status, stdout, stderr))) => Ok(format!(
                 "{stdout}\n--- stderr ---\n{stderr}\n--- exit status: {} ---",
                 status.code().unwrap_or(-1)
             )),
             failure => {
+                // We can't tell what is still running inside, so stop the
+                // container. tools::Shell then cancels the attempt.
                 self.close()
                     .await
                     .context("stop sandbox after shell watchdog failure")?;
@@ -209,7 +220,8 @@ async fn run(mut cmd: Command) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-// Drain both streams to EOF while retaining a bounded head and tail.
+// Drain the stream to EOF, keeping a bounded head and tail. Reading past the
+// cap keeps the writer from blocking on a full pipe.
 async fn bounded_read(mut reader: impl AsyncRead + Unpin) -> std::io::Result<String> {
     const HALF: usize = 16 * 1024;
     let mut head = Vec::new();

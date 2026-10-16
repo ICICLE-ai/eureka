@@ -1,6 +1,9 @@
 //! System instructions. The workflow is lean-beam's own skill (`SKILL.md` and
 //! its references, read from the checkout) with a mapping from the wrapper
 //! commands it names to the MCP tools the model actually has.
+//!
+//! When you add or rename a tool, update the table below as well as the tool's
+//! own description.
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -36,6 +39,7 @@ pub fn instructions(
         &std::fs::read_to_string(&main).with_context(|| format!("read {}", main.display()))?,
     );
     for name in REFERENCES {
+        // Optional: older skill checkouts don't have all of them.
         let path = skill_dir.join("references").join(name);
         if let Ok(text) = std::fs::read_to_string(&path) {
             skill.push_str(&format!("\n\n---\n\n# Reference: {name}\n\n{text}"));

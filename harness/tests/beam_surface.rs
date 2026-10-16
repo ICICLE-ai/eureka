@@ -1,5 +1,8 @@
 //! Drives every Beam operation the harness exposes against `examples/simple`,
-//! without a model. Skips when the Beam MCP server is not installed.
+//! without a model. Uses a host install at `~/.local/bin/lean-beam-mcp` and
+//! skips when it is missing:
+//!
+//!     cargo test --locked --manifest-path harness/Cargo.toml --test beam_surface -- --nocapture
 
 use harness::beam::{Beam, host_server};
 use harness::lean_text::command_line;
@@ -24,6 +27,7 @@ impl Drop for Project {
 }
 
 fn copy_dir(from: &Path, to: &Path) {
+    // Source only: skip build outputs and any old Beam session.
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
@@ -46,6 +50,7 @@ fn mcp_binary() -> Option<PathBuf> {
 }
 
 async fn call(beam: &Beam, _root: &Path, name: &str, args: Value) -> Value {
+    // MCP errors come back as text starting with ERROR (see beam::render).
     let text = beam.call(name, &args).await.unwrap();
     assert!(!text.starts_with("ERROR"), "{name} failed: {text}");
     serde_json::from_str(&text).unwrap_or_else(|_| panic!("{name} returned non-JSON: {text}"))
@@ -95,7 +100,7 @@ async fn every_lean_operation_works() {
         );
     }
 
-    // Document lifecycle.
+    // Document lifecycle. The sorries are only warnings, so the file is save_ready.
     let version = call(
         &beam,
         root,
@@ -131,6 +136,7 @@ async fn every_lean_operation_works() {
     // Handles: mint a root, branch twice (non-linear), continue linearly, release.
     let root_handle = call(&beam, root, "lean_run_at_handle", json!({"path": "Proofs/Solution.lean", "version": version, "line": 1, "character": 2, "text": "induction a"})).await;
     let handle = root_handle["next_handle"].clone();
+    // Handles are opaque. Reusing one branches; a linear call consumes it.
     assert!(handle.is_object(), "no handle in {root_handle}");
     assert_eq!(
         root_handle["proof_state"]["goals"]

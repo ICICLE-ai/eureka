@@ -1,3 +1,9 @@
+//! CLI entry point. Run it from the repository root: the `--comparator` and
+//! `--beam-skill` defaults are relative paths.
+//!
+//! Exits 0 when a proof is verified and published, 2 when every lead stopped
+//! without one, and 1 on any other error.
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use harness::agent::AgentConfig;
@@ -74,9 +80,14 @@ struct Cli {
     /// Memoize model responses here (replays identical requests for free).
     #[arg(long)]
     cache_dir: Option<PathBuf>,
-    /// Save model request bodies and parsed responses beside each attempt (no headers).
-    #[arg(long)]
+    /// Save requests, responses and stream events (no headers). Disable explicitly with =false.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+          num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     capture_requests: bool,
+    /// Require output-text token logprobs; missing scores are an error. Disable with =false.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+          num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    logprobs: bool,
     /// Extra stdio MCP server JSON config (name, command, args); runs in each sandbox.
     #[arg(long)]
     mcp: Vec<PathBuf>,
@@ -103,11 +114,14 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Catch bad paths, missing Comparator binaries and unknown theorem names
+    // before spending anything on the model.
     let template = std::fs::canonicalize(&cli.template)?;
     let packages = std::fs::canonicalize(&cli.packages)?;
     let mut verifier = verify::Comparator::from_checkout(&cli.comparator, &template)?;
     verifier.deps = Some(packages.clone());
     let mut options = Options::default();
+    // Beam keeps per-attempt session state in .beam; it isn't part of the project.
     options.excluded_names.insert(".beam".into());
     let pool = Pool::create(&template, &cli.store, options, Arc::new(verifier))?;
     let task = pool.task(RelPath::new(&cli.target)?)?;
@@ -121,6 +135,8 @@ async fn main() -> Result<()> {
     let artifacts = pool.store().join("attempts");
     std::fs::create_dir(&artifacts)?;
     if let Some(candidate) = &cli.verify_only {
+        // Re-check a saved file. No model or sandbox is involved, so this
+        // happens before the API key is read.
         let bytes = std::fs::read(candidate)?;
         let dir = artifacts.join("reverification");
         std::fs::create_dir(&dir)?;
@@ -143,6 +159,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     anyhow::ensure!(cli.agents > 0, "--agents must be positive");
+    // A seed only sets the starting file; the conversation starts fresh.
     let seed = cli.seed.as_ref().map(std::fs::read_to_string).transpose()?;
     let api_key = std::env::var("DEEPSEEK_API_KEY")
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
@@ -152,12 +169,14 @@ async fn main() -> Result<()> {
         .trim()
         .to_owned();
 
+    // The API key stays on the host. Sandboxes only get PoolConfig::env.
     let client = Client::new(ModelConfig {
         base_url: cli.base_url,
         api_key,
         model: cli.model,
         effort: cli.effort,
         max_output_tokens: cli.max_output_tokens,
+        logprobs: cli.logprobs,
         idle_timeout: Duration::from_secs(300),
         max_attempts: 5,
     })?;
@@ -189,6 +208,7 @@ async fn main() -> Result<()> {
             let mut text =
                 prompt::instructions(&template, &cli.target, !cli.no_shell, &cli.beam_skill)?;
             if cli.dont_give_up {
+                // Only the prompt changes; --max-turns still applies.
                 text.push_str("\n\nThis statement is definitely provable as stated. Do not give up and do not end the session without a verified submission: if one approach stalls, try another, split the hard claim among subagents, and keep going.\n");
             }
             text
@@ -216,6 +236,8 @@ async fn main() -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let signals = tokio::spawn(async move {
         tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+        // Cancel instead of exiting so every attempt can stop its container
+        // and save its candidate.
         eprintln!("stopping agents; saving candidates and joining children");
         stop.cancel();
     });

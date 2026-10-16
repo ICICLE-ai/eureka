@@ -1,6 +1,8 @@
 //! Tools the model can call inside one attempt. Beam tools come from the MCP
 //! server; the rest are the minimum needed to edit the target, look around, run
 //! commands in a sandbox, and declare completion.
+//!
+//! To add a tool, implement Tool and register it in `Harness::tools`.
 
 use crate::beam::{Beam, ToolSpec};
 use crate::lean_text::{command_line, tactic_block};
@@ -15,6 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use worktrees::RelPath;
 
+// Replies to the model are cut to MAX_OUTPUT. Files up to MAX_READ can still be
+// read and written.
 const MAX_OUTPUT: usize = 64 * 1024;
 const MAX_READ: u64 = 4 * 1024 * 1024;
 
@@ -27,6 +31,7 @@ pub enum Role {
 }
 
 /// Per-attempt context shared by all tools.
+/// `root` is the host directory mounted at `/work`.
 pub struct Ctx {
     pub id: String,
     pub role: Role,
@@ -35,6 +40,7 @@ pub struct Ctx {
     pub beam: Arc<Beam>,
     pub sandbox: Arc<Sandbox>,
     pub trace: Arc<Trace>,
+    /// Set by `submit` or `finish`; the loop ends after the current call.
     pub submitted: AtomicBool,
     pub note: Mutex<Option<String>>,
     pub artifacts: PathBuf,
@@ -48,6 +54,7 @@ pub trait Tool: Send + Sync {
 
 /// Function-tool definition in the Responses API shape.
 pub fn definition(spec: &ToolSpec) -> Value {
+    // Not strict: MCP schemas often use features strict mode rejects.
     json!({
         "type": "function",
         "name": spec.name,
@@ -73,6 +80,7 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 fn truncate(mut text: String) -> String {
+    // Keep the head and tail, cut on char boundaries (Lean output is full of Unicode).
     if text.len() > MAX_OUTPUT {
         let keep = MAX_OUTPUT / 2;
         let head = text.floor_char_boundary(keep);
@@ -144,6 +152,7 @@ impl Tool for ReadFile {
     fn call<'a>(&'a self, args: Value, ctx: &'a Ctx) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let rel = RelPath::new(str_arg(&args, "path")?)?;
+            // read_beneath won't follow symlinks out of the root.
             let text = String::from_utf8(worktrees::read_beneath(&ctx.root, &rel, MAX_READ)?)?;
             Ok(truncate(
                 text.lines()
@@ -156,6 +165,8 @@ impl Tool for ReadFile {
     }
 }
 
+/// Writes the target file only. The shell can still change other files in
+/// /work, but those never reach the verifier.
 pub struct WriteFile;
 
 impl Tool for WriteFile {
@@ -213,6 +224,8 @@ impl Tool for Shell {
                 bail!("timeout_seconds must be 1..1800");
             }
             match ctx.sandbox.shell(command, timeout).await {
+                // A failing command is Ok, with the exit code in the text. Err
+                // means the sandbox itself broke, so the attempt is over.
                 Ok(output) => Ok(output),
                 Err(error) => {
                     ctx.stop.cancel();
@@ -297,6 +310,8 @@ impl Tool for LeanCheck {
 
 // --- Submit -----------------------------------------------------------------
 
+/// Only sets a flag. The check happens in search.rs after the loop ends, and
+/// nothing here stops the model from submitting a file that still has sorries.
 pub struct Submit;
 
 impl Tool for Submit {
@@ -321,6 +336,8 @@ impl Tool for Submit {
 
 // --- Finish (subagents) -----------------------------------------------------
 
+/// The helper's `submit`. A note is required, and the file goes back to the
+/// lead without being checked.
 pub struct Finish;
 
 impl Tool for Finish {
@@ -347,6 +364,7 @@ impl Tool for Finish {
 pub struct ExtraTool {
     pub spec: ToolSpec,
     pub original_name: String,
+    /// Shared by every tool from the same server.
     pub server: Arc<Beam>,
 }
 impl Tool for ExtraTool {

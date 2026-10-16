@@ -1,4 +1,10 @@
 //! Append-only events and durable artifacts, outside the writable sandbox.
+//!
+//! The whole run shares one Trace. Events are appended without fsync; files
+//! written with `artifact` (candidate.lean, result.json, ...) are replaced
+//! atomically and synced. Use a new trace file for each run: the file is
+//! appended to and attempt IDs start from 1 again. Traces contain full prompts
+//! and source code.
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::fs::{File, OpenOptions};
@@ -9,6 +15,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Trace {
+    // Locked per line so concurrent attempts don't interleave.
     file: Mutex<File>,
     error: Mutex<Option<String>>,
 }
@@ -26,6 +33,8 @@ impl Trace {
         })
     }
 
+    /// `event` doesn't return errors, so a failed write is remembered and
+    /// reported here. agent.rs calls this before every model turn.
     pub fn check(&self) -> Result<()> {
         if let Some(error) = &*self.error.lock().unwrap() {
             bail!("trace write failed: {error}");
@@ -52,6 +61,8 @@ impl Trace {
 }
 
 /// Atomic, durable replacement in a private directory never mounted in a sandbox.
+/// The parent must exist. A leftover `.tmp` file (from a crash or a concurrent
+/// write to the same path) makes this fail rather than get overwritten.
 pub fn artifact(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp = path.with_extension("tmp");
     let mut file = OpenOptions::new()
