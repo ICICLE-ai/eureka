@@ -184,11 +184,11 @@ async fn main() -> Result<()> {
         idle_timeout: Duration::from_secs(300),
         max_attempts: 5,
     })?;
-    let beam_pool = PoolConfig {
-        endpoint: cli.pool_endpoint,
+    let beam_pool = PoolConfig::new(
+        cli.pool_endpoint,
         token,
-        attach_timeout: Duration::from_secs(cli.pool_attach_timeout_secs),
-    };
+        Duration::from_secs(cli.pool_attach_timeout_secs),
+    );
     let harness = Arc::new(Harness {
         task,
         client,
