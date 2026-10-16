@@ -35,6 +35,7 @@ const SESSION_DIR: &str = ".beam";
 // Under .beam, which main.rs excludes from snapshots.
 const STAGED: &str = ".beam/staged";
 /// Checks a sandbox against an earlier attachment instead of hashing it again.
+/// Python so it uses Beam's own file filter and digests; see its docstring.
 const REATTACH: &str = include_str!("reattach.py");
 // Seed files for REATTACH, under .beam and removed once it has run.
 const SEED_SCRIPT: &str = "reattach.py";

@@ -12,6 +12,17 @@ On success it writes C and its manifest as `beam_pool attach` does and prints th
 same kind of JSON. Any mismatch exits non-zero, and the harness attaches in full.
 
 Runs in the sandbox with PYTHONPATH pointing at Beam, next to scripts.beam_pool.
+
+Why Python in a Rust harness: it imports Beam's own input filter, excluded
+directories and digest function from the image, so which files count can't drift
+from what `beam_pool attach` and the Beam runtime use. That is the only strong
+reason. Running in the sandbox is not essential: the host sees the same files
+through the bind mounts, and only the `info` call needs the agents network.
+It depends on scripts.beam_pool internals, not a public API; if a new image
+changes them this fails and the harness falls back to a full attach.
+A Rust port on the host would be faster (parallel walk) and type-checked, but
+needs its own copy of Beam's filter and a test comparing it with `input_file`
+over the whole package tree to catch drift.
 """
 
 import argparse
