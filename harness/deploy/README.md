@@ -45,10 +45,11 @@ The pods read that token from the Tapis secret `infinileantoken`. If you only ha
         > .secrets/tapis-pool.token
 
     scripts/connect-tapis.sh
-    API_KEY_FILE=/path/to/vista.key scripts/run-tapis.sh runs/problem runs/mine
+    BASE_URL=http://vista.tacc.utexas.edu:<port>/v1 API_KEY_FILE=/path/to/vista.key \
+        scripts/run-tapis.sh runs/problem runs/mine
 
 `connect-tapis.sh` starts the bridge and prints the pool's status; check that some workers are `"ready": true`.
-`run-tapis.sh` is `run.sh` with `--pool-endpoint tapis-gateway:9000`, the Tapis token, and the Vista endpoint and model as defaults.
+`run-tapis.sh` is `run.sh` with `--pool-endpoint tapis-gateway:9000`, the Tapis token, and the Vista model as defaults. `BASE_URL` is required, because the Vista port changes whenever the deployment restarts.
 Leave `RETRIEVAL` unset here; the supplied retrieval image is built for the local pool.
 
 The sandbox image has to contain exactly the same prepared project as the Tapis workers, because attaching compares every file, compiled Mathlib included.
