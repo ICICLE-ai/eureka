@@ -1,4 +1,12 @@
-//! Attempts own their sandbox and child tasks until cleanup has completed.
+//! Runs the leads and their helpers, verifies submissions, publishes the winner.
+//!
+//! `run_attempt` takes every attempt through the same steps: copy the template,
+//! write the seed, start and attach a sandbox, run the agent, cancel and join
+//! its helpers, stop the sandbox, freeze the target, save candidate.lean, and
+//! verify it if a lead submitted. The file is frozen only after every writer
+//! has stopped, and saved before the verifier runs. Helpers never publish; the
+//! lead gets their file back as text. Attempts save their files under
+//! `<pool>/attempts/<id>/`, which no sandbox can see.
 use crate::agent::{self, AgentConfig, Outcome};
 use crate::beam::{Beam, ExtraServer, ToolSpec};
 use crate::pool::PoolConfig;
@@ -19,6 +27,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use worktrees::{Error, Frozen, PublishOutcome, Published, Task, Verified};
 
+/// Everything the attempts of one run share. Per-attempt state is in tools::Ctx.
 pub struct Harness {
     pub task: Task,
     pub client: Client,
@@ -30,12 +39,15 @@ pub struct Harness {
     pub shell: bool,
     pub shell_timeout: Duration,
     pub stop: CancellationToken,
+    /// Total across all leads and helpers.
     pub usage: Mutex<Usage>,
     pub artifacts: PathBuf,
     pub next_id: AtomicU64,
     pub extra_servers: Vec<ExtraServer>,
 }
 
+/// How an attempt ended. `termination` is why the conversation stopped;
+/// `verdict` is what happened to the saved file afterwards.
 pub struct AttemptResult {
     pub id: String,
     pub label: String,
@@ -50,6 +62,7 @@ pub struct AttemptResult {
     pub artifacts: PathBuf,
 }
 
+/// `Finished` means a helper called `finish`. Only `Verified` can be published.
 pub enum Verdict {
     NotSubmitted,
     Finished,
@@ -59,6 +72,8 @@ pub enum Verdict {
 }
 
 impl AttemptResult {
+    /// Used for result.json, the attempt_end event and child handoffs.
+    /// trace_report.py reads these fields.
     pub fn report(&self) -> Value {
         let (status, detail) = match &self.verdict {
             Verdict::NotSubmitted => ("not_submitted", ""),
@@ -98,6 +113,7 @@ impl Children {
 
 impl Harness {
     fn id(&self) -> String {
+        // Unique within the run; labels come from the model and can repeat.
         format!(
             "attempt-{:06}",
             self.next_id.fetch_add(1, Ordering::Relaxed)
@@ -126,6 +142,7 @@ impl Harness {
             }));
         }
         if role == Role::Lead {
+            // Only leads can spawn, so helpers never have helpers of their own.
             tools.push(Arc::new(Subagents {
                 harness: Arc::downgrade(self),
                 children: children.clone(),
@@ -144,6 +161,8 @@ impl Harness {
         tools
     }
 
+    /// Run one attempt from setup to verification, cleaning up even on failure.
+    /// Boxed because Subagents calls it recursively.
     pub fn run_attempt<'a>(
         self: &'a Arc<Self>,
         id: String,
@@ -163,6 +182,7 @@ impl Harness {
             );
             let task = self.task.clone();
             let attempt_id = id.clone();
+            // worktrees is synchronous and copies the whole project.
             let attempt = tokio::task::spawn_blocking(move || -> Result<_> {
                 let mut attempt = task.attempt(attempt_id)?;
                 if let Some(seed) = seed {
@@ -178,6 +198,7 @@ impl Harness {
             }));
             let mut sandbox = None;
             let mut note = None;
+            // Errors in here still fall through to the cleanup below.
             let mut outcome = match async {
                 let s = Arc::new(Sandbox::create(&self.sandbox, &id, &root).await?);
                 sandbox = Some(s.clone());
@@ -270,6 +291,7 @@ impl Harness {
                 );
             }
             self.usage.lock().unwrap().add(&outcome.usage);
+            // Keeps only the target file; the rest of the workspace is discarded.
             let frozen = tokio::task::spawn_blocking(move || attempt.freeze()).await?;
             let mut result = AttemptResult {
                 id: id.clone(),
@@ -307,6 +329,8 @@ impl Harness {
                 &serde_json::to_vec_pretty(&pending)?,
             )?;
             result.verdict = match (outcome.error, frozen) {
+                // Something broke (model, cleanup, capture). That says nothing
+                // about the proof, so it's Failed rather than Rejected.
                 (Some(error), _) => Verdict::Failed(error),
                 (None, Some(frozen)) if result.submitted && role == Role::Lead => {
                     self.trace.event(
@@ -337,12 +361,16 @@ impl Harness {
         })
     }
 
+    /// Publish a verified proof and stop all other attempts. If another lead
+    /// already won, its proof is returned instead.
     pub async fn publish(self: &Arc<Self>, verified: Verified) -> Result<Published> {
         let task = self.task.clone();
         let outcome = tokio::task::spawn_blocking(move || task.publish(verified)).await?;
         let published = match outcome {
             Ok(PublishOutcome::Committed(p)) | Ok(PublishOutcome::AlreadyWon(p)) => p,
             Err(Error::CommitUncertain { published, source }) => {
+                // The proof is published but may not have reached disk. It's
+                // still the winner; just record the problem.
                 self.trace.event(
                     "harness",
                     "commit_uncertain",
@@ -356,6 +384,8 @@ impl Harness {
         Ok(published)
     }
 
+    /// Run `n` leads in parallel and return the published proof, if any. Waits
+    /// for every lead to finish cleaning up before pruning containers.
     pub async fn independent(
         self: &Arc<Self>,
         n: usize,
@@ -433,6 +463,7 @@ pub async fn verify_candidate(task: Task, frozen: Frozen, dir: &Path) -> Result<
     let mut frozen = frozen;
     let mut reports = String::new();
     for round in 1..=2 {
+        // `verify` consumes `frozen`, so keep the bytes for a retry.
         let bytes = frozen.bytes().to_vec();
         let result = tokio::task::spawn_blocking(move || frozen.verify())
             .await
@@ -455,6 +486,7 @@ pub async fn verify_candidate(task: Task, frozen: Frozen, dir: &Path) -> Result<
 }
 
 struct Subagents {
+    // Weak, because Harness indirectly owns this tool.
     harness: std::sync::Weak<Harness>,
     children: Arc<tokio::sync::Mutex<Children>>,
     wait: bool,
@@ -478,6 +510,7 @@ impl Tool for Subagents {
                     completed.push(child_report(joined));
                 }
                 while let Some(joined) = children.running.try_join_next() {
+                    // Also collect any others that are already done.
                     completed.push(child_report(joined));
                 }
                 return Ok(serde_json::to_string(
@@ -493,6 +526,7 @@ impl Tool for Subagents {
                 .and_then(Value::as_array)
                 .context("missing tasks")?;
             if tasks.is_empty() || tasks.len() + children.running.len() > 8 {
+                // Finished children count until wait_subagents collects them.
                 bail!("1..8 tasks; collect previous children before exceeding 8");
             }
             let tasks: Vec<(String, String)> = tasks
@@ -507,6 +541,7 @@ impl Tool for Subagents {
                     ))
                 })
                 .collect::<Result<_>>()?;
+            // Don't hand every helper the same broken file. Sorries are fine.
             let sync = ctx.beam.call("lean_sync", &json!({"path": ctx.target.as_str(), "diagnostic_scope": "all", "diagnostics_in_result": true})).await?;
             let diagnostics: Value =
                 serde_json::from_str(&sync).with_context(|| format!("seed sync failed: {sync}"))?;
@@ -544,6 +579,7 @@ impl Tool for Subagents {
     }
 }
 
+// The lead gets the helper's file as text and decides what to merge.
 fn child_report(joined: Result<Result<AttemptResult>, tokio::task::JoinError>) -> Value {
     match joined.map_err(anyhow::Error::from).and_then(|r| r) {
         Ok(r) => {
@@ -561,6 +597,7 @@ mod tests {
     use worktrees::{Options, Pool, RelPath, Verification, Verifier, VerifyError};
 
     struct CrashOnce(AtomicU64);
+    // Crashes on the first call and passes on the second.
     impl Verifier for CrashOnce {
         fn policy_id(&self) -> &str {
             "crash-once-test"

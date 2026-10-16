@@ -1,8 +1,12 @@
 //! The model/tool loop for one attempt.
 //!
-//! History is append-only so the provider's prefix cache keeps hitting; every
-//! request is also memoized on disk (keyed by its exact body) when a cache
-//! directory is configured, which makes reruns and tests free.
+//! search.rs sets up the sandbox and tools, calls `run`, and does cleanup and
+//! verification afterwards. `run` returns an Outcome even when the model fails,
+//! so the caller can still save the target file.
+//!
+//! History is append-only so the provider's prefix cache keeps hitting. With
+//! `--cache-dir`, every request is also memoized on disk, keyed by its exact
+//! body, which makes reruns and tests free.
 
 use crate::responses::{Client, Completion, Item, Usage, parse_arguments};
 use crate::tools::{Ctx, Tool, definition};
@@ -16,6 +20,7 @@ use std::time::Instant;
 
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
+    /// HTTP retries within a turn don't count against this.
     pub max_turns: usize,
     pub cache_dir: Option<PathBuf>,
     pub capture_requests: bool,
@@ -23,6 +28,7 @@ pub struct AgentConfig {
 
 #[derive(Debug, Default)]
 pub struct Outcome {
+    /// The model called `submit` (lead) or `finish` (helper). Nothing is verified yet.
     pub submitted: bool,
     pub turns: usize,
     pub usage: Usage,
@@ -31,6 +37,8 @@ pub struct Outcome {
     pub termination: String,
 }
 
+/// On error, the Outcome still has the usage and last message from the turns
+/// that completed.
 pub async fn run(
     client: &Client,
     config: &AgentConfig,
@@ -90,16 +98,27 @@ async fn run_loop(
             .artifacts
             .join(format!("request-{:04}.json", outcome.turns));
         if config.capture_requests {
+            // The API key is sent as a header, so the body is safe to save.
             crate::trace::artifact(&request_file, &serde_json::to_vec(&body)?)?;
         }
         ctx.trace.event(&ctx.id, "model_start", json!({"turn": outcome.turns, "request": config.capture_requests.then_some(&request_file)}));
         let (completion, cached) = match cached_completion(config, &body, client.endpoint()) {
             Some(c) => (c, true),
             None => {
+                let capture = config
+                    .capture_requests
+                    .then(|| {
+                        crate::trace::Trace::open(
+                            &ctx.artifacts
+                                .join(format!("stream-{:04}.jsonl", outcome.turns)),
+                        )
+                    })
+                    .transpose()?;
                 let c = tokio::select! {
                     biased;
+                    // Check cancellation first so a stopped attempt doesn't take another turn.
                     _ = ctx.stop.cancelled() => { outcome.termination = "cancelled".into(); break; }
-                    result = client.complete(&body, &ctx.trace, &ctx.id) => result?,
+                    result = client.complete(&body, &ctx.trace, &ctx.id, capture.as_ref()) => result?,
                 };
                 store_completion(config, &body, &c, client.endpoint());
                 (c, false)
@@ -122,6 +141,9 @@ async fn run_loop(
                 "text": completion.items.iter().filter_map(Item::assistant_text).collect::<Vec<_>>().join("\n"),
             }),
         );
+        if client.config.logprobs {
+            completion.require_logprobs()?;
+        }
         if let Some(text) = completion
             .items
             .iter()
@@ -145,6 +167,7 @@ async fn run_loop(
             })
             .collect();
         let incomplete = completion.incomplete.clone();
+        // Function calls have to come before their outputs in the history.
         items.extend(completion.items);
         if calls.is_empty() {
             if let Some(reason) = incomplete {
@@ -154,6 +177,7 @@ async fn run_loop(
                 )));
                 continue;
             }
+            // A reply with no tool calls ends the attempt without a submission.
             outcome.termination = "no_tool_calls".into();
             break;
         }
@@ -168,6 +192,7 @@ async fn run_loop(
             };
             items.push(Item::output(call_id, output));
             if ctx.submitted.load(Ordering::SeqCst) {
+                // Skip anything the model queued after submit/finish.
                 break;
             }
         }
@@ -180,6 +205,9 @@ async fn run_loop(
     Ok(())
 }
 
+/// Run one tool call. Errors are returned as `ERROR: ...` text for the model to
+/// read. If the watchdog fires, the tool may be wedged, so the whole attempt is
+/// cancelled.
 async fn invoke(
     tools: &[Arc<dyn Tool>],
     call_id: &str,
@@ -198,6 +226,7 @@ async fn invoke(
         parse_arguments(arguments),
     ) {
         (Some(tool), Ok(args)) => {
+            // Longer than the maximum shell timeout, so this only fires for a stuck tool.
             match tokio::time::timeout(std::time::Duration::from_secs(1830), tool.call(args, ctx))
                 .await
             {
@@ -222,6 +251,7 @@ async fn invoke(
 fn cache_path(config: &AgentConfig, body: &Value, endpoint: &str) -> Option<PathBuf> {
     let dir = config.cache_dir.as_ref()?;
     let mut hash = Sha256::new();
+    // Include the endpoint so two servers with the same model name don't share entries.
     hash.update(endpoint.as_bytes());
     hash.update([0]);
     hash.update(serde_json::to_vec(body).ok()?);
@@ -230,11 +260,13 @@ fn cache_path(config: &AgentConfig, body: &Value, endpoint: &str) -> Option<Path
 }
 
 fn cached_completion(config: &AgentConfig, body: &Value, endpoint: &str) -> Option<Completion> {
+    // An unreadable entry is a miss.
     let text = std::fs::read(cache_path(config, body, endpoint)?).ok()?;
     serde_json::from_slice(&text).ok()
 }
 
 fn store_completion(config: &AgentConfig, body: &Value, completion: &Completion, endpoint: &str) {
+    // Best effort: a failed cache write shouldn't fail the turn.
     if let Some(path) = cache_path(config, body, endpoint) {
         let _ = std::fs::create_dir_all(path.parent().unwrap());
         let _ = std::fs::write(path, serde_json::to_vec(completion).unwrap_or_default());

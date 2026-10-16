@@ -2,6 +2,9 @@
 //! image (`deploy/beam-pool` in the lean-beam checkout). Sandboxes attach to it
 //! for speculative execution; sync, goals and todo stay on the sandbox's own
 //! Lean server. This module knows the image's layout and the attach protocol.
+//!
+//! The pool must already be running (see `harness/deploy/README.md`). Beam's
+//! side of the attach protocol is `lean-beam/scripts/beam_pool`.
 
 use crate::sandbox::{Sandbox, WORK};
 use anyhow::{Context, Result, bail};
@@ -28,18 +31,21 @@ const PREPARED: &[&str] = &[
     ".beam",
 ];
 const SESSION_DIR: &str = ".beam";
+// Under .beam, which main.rs excludes from snapshots.
 const STAGED: &str = ".beam/staged";
 
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
     /// `host:port` of the gateway as seen from the agents network.
     pub endpoint: String,
+    /// Shared secret from `--pool-token-file`.
     pub token: String,
 }
 
 impl PoolConfig {
     /// Environment every sandbox command needs to use Beam against the pool.
     pub fn env(&self) -> Vec<(String, String)> {
+        // Paths inside the container.
         [
             ("BEAM_HOME", image::BEAM_HOME.to_owned()),
             ("BEAM_SESSION_ROOT", format!("{WORK}/{SESSION_DIR}")),
@@ -83,6 +89,7 @@ impl PoolConfig {
         .await
         .context("pool attachment timeout")
         .and_then(|r| r);
+        // Put the files back before returning any attach error.
         for name in moved {
             std::fs::rename(staged.join(&name), root.join(&name))?;
         }
@@ -123,6 +130,7 @@ impl PoolConfig {
             .await
             .context("beam-pool attach")?;
         let stdout = String::from_utf8_lossy(&out.stdout);
+        // Require the snapshot descriptor in the output, not just exit 0.
         if !out.status.success() || !stdout.contains("\"snapshot\"") {
             bail!(
                 "beam-pool attach failed: {}{}",

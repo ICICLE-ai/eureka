@@ -1,0 +1,2 @@
+# Optional terminal dashboard; plain text and JSON use only the standard library.
+rich>=13.7,<15

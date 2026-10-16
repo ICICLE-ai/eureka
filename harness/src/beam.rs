@@ -2,8 +2,12 @@
 //!
 //! The server is any stdio command: inside the attempt's sandbox in production,
 //! a host install in tests. `workspace` is the attempt root as the server sees
-//! it and is injected into every call, so the model can only address its own
-//! attempt. Every probe reaches Beam, which owns version and handle validation.
+//! it. It is injected into every call, replacing anything the model passed, so
+//! the model can only address its own attempt. Beam itself checks versions and
+//! handles.
+//!
+//! The tool list comes from the server when it starts. Extra MCP servers
+//! (`--mcp`) use the same client, without the workspace injection.
 
 use anyhow::{Context, Result, anyhow};
 use rmcp::ServiceExt;
@@ -26,9 +30,11 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// The server's `readOnlyHint`. Informational only; nothing uses it.
     pub read_only: bool,
 }
 
+/// A running MCP server and the tools it advertised. Each attempt starts its own.
 pub struct Beam {
     service: RunningService<RoleClient, ()>,
     tools: Vec<ToolSpec>,
@@ -70,15 +76,16 @@ impl Beam {
         &self.tools
     }
 
-    /// Call `name` for this attempt. Returns the tool's text result; `Err`
-    /// only for transport failures. Lean-level failures are returned as text
-    /// so the model can read them.
+    /// Call `name` for this attempt. Returns the tool's text result; `Err` only
+    /// for bad arguments or transport failures. Lean-level failures come back
+    /// as text so the model can read them.
     pub async fn call(&self, name: &str, args: &Value) -> Result<String> {
         let mut arguments: Map<String, Value> = match args {
             Value::Object(m) => m.clone(),
             _ => return Err(anyhow!("arguments must be an object")),
         };
         if let Some(workspace) = &self.workspace {
+            // Replaces any `workspace` the model supplied.
             arguments.insert("workspace".into(), json!({"root": workspace}));
         }
         let mut params = CallToolRequestParams::new(name.to_owned());
@@ -118,8 +125,8 @@ fn to_spec(tool: &Tool, beam: bool) -> ToolSpec {
 }
 
 /// Flatten an MCP tool result into text: structured content when present,
-/// otherwise the concatenated text parts. Errors are prefixed so the model
-/// cannot mistake them for success.
+/// otherwise the concatenated text parts. Errors are prefixed with `ERROR`
+/// so the model can't mistake them for success.
 fn render(result: &Value) -> String {
     let mut out = String::new();
     if result.get("isError") == Some(&Value::Bool(true)) {
@@ -140,6 +147,7 @@ fn render(result: &Value) -> String {
 }
 
 /// A Beam server from a host install, for tests and local experiments.
+/// Production uses PoolConfig::mcp, which runs the server inside the sandbox.
 pub fn host_server(binary: &Path) -> tokio::process::Command {
     tokio::process::Command::new(binary)
 }
@@ -160,7 +168,8 @@ mod tests {
     }
 }
 
-/// Trusted launch configuration; each server runs inside each attempt sandbox.
+/// An `--mcp` config file. The server is started inside every attempt's
+/// sandbox, so `command` must exist in the sandbox image.
 #[derive(Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtraServer {
@@ -172,6 +181,8 @@ pub struct ExtraServer {
 impl ExtraServer {
     pub fn load(path: &Path) -> Result<Self> {
         let config: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        // `name` becomes part of every tool name (`mcp_<name>_<tool>`), so check
+        // it now rather than after the agents have started.
         anyhow::ensure!(
             !config.name.is_empty()
                 && config

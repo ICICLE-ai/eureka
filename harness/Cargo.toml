@@ -1,4 +1,5 @@
 [package]
+# The modules live in a library so tests/ can use them; src/main.rs is the CLI.
 name = "harness"
 version = "0.1.0"
 edition = "2024"
@@ -6,12 +7,14 @@ rust-version = "1.91"
 publish = false
 
 [dependencies]
+# Attempt workspaces, verification and winner publication.
 worktrees = { path = "../worktrees" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 eventsource-stream = "0.2"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# Pinned to a commit; beam.rs is written against this version's API.
 rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "3e636cab26c013eca5131103c03d20237f12c4df", default-features = false, features = ["client", "transport-child-process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

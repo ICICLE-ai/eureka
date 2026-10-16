@@ -1,5 +1,8 @@
 //! Text rules for Beam probes, kept pure so they can be tested on the exact
 //! inputs models produce.
+//!
+//! Both are line-based heuristics, not a parser. They only change what is sent
+//! to Beam, never the proof file.
 
 use std::borrow::Cow;
 
@@ -35,7 +38,7 @@ const COMMANDS: &[&str] = &[
 /// Beam's tactic mode accepts exactly one tactic node. A model usually writes a
 /// sequence (`t1\n  t2` or `t1; t2`), which fails with "expected end of input"
 /// at the second tactic. Wrapping the sequence in parentheses makes it one
-/// node with the same meaning. Commands and already-grouped text are untouched.
+/// node with the same meaning. Commands and already-grouped text are only dedented.
 pub fn tactic_block(text: &str) -> Cow<'_, str> {
     let dedented = dedent(text);
     let trimmed = dedented.trim();
@@ -51,6 +54,7 @@ pub fn tactic_block(text: &str) -> Cow<'_, str> {
         .lines()
         .next()
         .is_some_and(|l| l.replace("<;>", "").contains(';'));
+    // `t1 <;> t2` is already a single node; only a bare `;` makes a sequence.
     if !multi_line && !sequenced {
         return if dedented == text {
             Cow::Borrowed(text)
@@ -74,6 +78,7 @@ pub fn tactic_block(text: &str) -> Cow<'_, str> {
 }
 
 fn is_command(text: &str) -> bool {
+    // Whole keywords only, so the `classical` tactic isn't taken for `class`.
     text.starts_with('#')
         || text.starts_with("@[")
         || text.starts_with("/-")
@@ -120,6 +125,8 @@ fn dedent(text: &str) -> String {
 /// The 0-based line at which a command-mode probe sees every declaration of
 /// the file but the last: the start of the last top-level declaration. Lines
 /// after it are inside that declaration, where Beam switches to tactic mode.
+/// This just finds the last unindented line, so a trailing `end Foo` wins if
+/// the file has one.
 pub fn command_line(source: &str) -> usize {
     source
         .lines()

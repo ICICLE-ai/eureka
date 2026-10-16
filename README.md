@@ -2,17 +2,125 @@
 
 In development.
 
-Clone with `--recurse-submodules`. Set up the [Beam pool](harness/deploy/README.md) and [Comparator](comparator/README.md).
-Copy `examples/simple/` to your own problem directory. Keep its build files.
-Put your theorem statements in both `Proofs/Challenge.lean` and `Proofs/Solution.lean`, with `sorry` proofs.
-List their full names in `config.json` under `theorem_names`.
-Set `DEEPSEEK_API_KEY` in your environment. Run from the repository root:
+## Quick start
+
+The `scripts/` directory wraps the steps below. From the repository root:
+
+```bash
+scripts/build.sh                    # Comparator and the harness
+scripts/setup-pool.sh               # Beam image, packages, token, pool (WORKERS=4)
+scripts/setup-retrieval.sh          # optional: Loogle and lemma search
+scripts/new-problem.sh /path/to/Problem.lean runs/problem MyProblem.main_theorem
+scripts/run.sh runs/problem runs/mine    # BASE_URL, MODEL, RETRIEVAL=1 as needed
+scripts/watch.sh runs/mine
+scripts/stop.sh runs/mine                # optional: stop early
+scripts/restart.sh runs/mine runs/next   # continue a stopped run from its saved proof
+scripts/reverify.sh runs/problem path/to/candidate.lean runs/recheck
+scripts/stop-services.sh            # shut down the pool and retrieval
+```
+
+To use the Beam pool on Tapis instead of a local one, put its token in `.secrets/tapis-pool.token` and replace `setup-pool.sh` and `run.sh` with `connect-tapis.sh` and `run-tapis.sh`. Those default to the model served on Vista. See [Using the pool on Tapis](harness/deploy/README.md#using-the-pool-on-tapis).
+
+The packages and pool token default to `pool-packages/` and `pool.token` in the repository root; set `PACKAGES` and `POOL_TOKEN_FILE` to use other paths.
+Each script explains its arguments at the top. The rest of this README covers the same steps by hand.
+
+Every run saves model requests, responses and stream events, including reasoning returned by the provider.
+Output-text token logprobs are required by default. Missing or unsupported scores stop the run with an error.
+Use `LOGPROBS=false` only to explicitly allow a run without them.
+The files live under `store/pool-*/attempts/<id>/`. API authorization headers are never saved.
+
+To rescore saved text with vLLM, use the full rendered prompt and answer:
+
+```bash
+BASE_URL=http://vista.tacc.utexas.edu:60286/v1 MODEL=DeepSeek-V4.1-Flash \
+  API_KEY_FILE=.secrets/vista-60286-api.key \
+  python3 scripts/score-logprobs.py rendered.txt --output scores.json
+```
+
+These are new scores, not recovered historical logprobs. Missing context or reasoning cannot be restored.
+Use `--continuation answer.txt` to append an answer, or `--token-ids` to read a JSON array of exact token IDs.
+No chat template is added. The first token normally has no score. Missing scores after it cause an error.
+
+`restart.sh` keeps the saved proof, handoff notes and verifier feedback. The conversation starts fresh.
+Use the same model and pool environment settings as before. It enables `--dont-give-up` through `run.sh`.
+It defaults to `attempt-000001`; pass another attempt ID as the third argument to resume that one.
+
+## Setup
+
+You need Linux, Docker, Rust 1.91+, Python 3.10+, and Lean (installed with elan).
+Clone with `--recurse-submodules`, then set up the [Beam pool](harness/deploy/README.md) and [Comparator](comparator/README.md).
+Comparator also needs `landrun` and a working systemd user session.
+
+Build Comparator and the harness from the repository root:
 
 ```bash
 (cd comparator && lake build lean4export comparator)
-mkdir -p runs/mine/store
-cargo run --locked --manifest-path harness/Cargo.toml -- \
-  --template /path/to/your/problem --store runs/mine/store \
-  --packages /path/to/pool-packages --pool-token-file /path/to/pool.token \
-  --trace runs/mine/trace.jsonl
+cargo build --locked --manifest-path harness/Cargo.toml
 ```
+
+## Setting up a problem
+
+Start from the example template and keep its build files, so the Lean and Mathlib versions match the pool.
+Your Lean file should have the imports, definitions and theorem statements, with `sorry` for every proof.
+It goes in as both the challenge and the starting solution:
+
+```bash
+mkdir -p runs
+cp -r examples/simple runs/problem
+cp /path/to/Problem.lean runs/problem/Proofs/Challenge.lean
+cp runs/problem/Proofs/Challenge.lean runs/problem/Proofs/Solution.lean
+```
+
+Set `theorem_names` in `runs/problem/config.json` to the fully qualified names, e.g. `MyProblem.main_theorem`.
+Then read through `Challenge.lean` carefully. Those statements are exactly what the verifier checks.
+
+## Running
+
+Set the endpoint and model. On Vista, use your deployment's URL; the port can change.
+The API key is read from the terminal so it stays out of your shell history:
+
+```bash
+BASE_URL=http://vista.tacc.utexas.edu:60286/v1
+MODEL=DeepSeek-V4.1-Flash
+read -rsp 'API key: ' DEEPSEEK_API_KEY
+echo
+export DEEPSEEK_API_KEY
+```
+
+Other providers work if they support the `/responses` API. For DeepSeek's own API, use `https://api.deepseek.com` and `deepseek-flash`.
+
+Start the run, replacing the package and token paths with the ones from your pool setup.
+Use a new `RUN` directory each time. The harness runs under `nohup`, so closing the terminal won't stop it:
+
+```bash
+RUN=runs/mine
+mkdir -p "$RUN/store"
+nohup harness/target/debug/harness \
+  --template runs/problem --store "$RUN/store" \
+  --packages /path/to/pool-packages --pool-token-file /path/to/pool.token \
+  --base-url "$BASE_URL" --model "$MODEL" \
+  --max-turns 200 --max-output-tokens 200000 --dont-give-up \
+  --trace "$RUN/trace.jsonl" > "$RUN/run.log" 2>&1 &
+echo $! > "$RUN/pid"
+```
+
+`--max-output-tokens` includes reasoning, and input plus output has to fit in the server's context window.
+To give the agents Loogle and lemma search, set up the [retrieval tools](tools/retrieval/README.md) and add `--image eureka-agent:local --mcp tools/retrieval/mcp.json`.
+
+To stop a run early, use `scripts/stop.sh "$RUN"`. The agents save their work before the harness exits.
+
+## Watching a run
+
+In another terminal, with `RUN` set to the same directory:
+
+```bash
+RUN=runs/mine
+scripts/watch.sh "$RUN"
+```
+
+This shows each agent's status, turns, token usage and tool errors.
+The live dashboard needs Rich: `python3 -m pip install -r harness/requirements.txt`.
+Pass several run directories to `scripts/watch.sh` to see them together. Ctrl-C closes only the monitor.
+For a snapshot or JSON, use `python3 harness/trace_report.py "$RUN/trace.jsonl"` with optional `--json`.
+A long model response can leave the trace quiet for a while until it finishes.
+In the status column, `verified` means Comparator accepted the proof, `finished` means a helper handed its work back to the lead, and `not_submitted` means the agent stopped without submitting anything.

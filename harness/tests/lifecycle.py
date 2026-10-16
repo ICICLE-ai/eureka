@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """Local integration tests: real sandboxes/Beam/Comparator, scripted model responses.
-Run after cargo build, with HARNESS_PACKAGES and HARNESS_POOL_TOKEN_FILE set.
 No model provider, API keys, or paid requests are used.
+
+Build the harness, start the Beam pool, then from the repository root:
+    export HARNESS_PACKAGES=/path/to/pool-packages
+    export HARNESS_POOL_TOKEN_FILE=/path/to/pool.token
+    python3 harness/tests/lifecycle.py -v
+
+test_retrieval_in_sandbox also needs HARNESS_RETRIEVAL_IMAGE and the retrieval service.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -21,18 +27,28 @@ def call(name, args):
 
 
 class Model(BaseHTTPRequestHandler):
+    # Fake /responses endpoint. Each test scripts the replies with server.respond.
     def log_message(self, *_):
         pass
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         try:
+            if getattr(self.server, 'reject_logprobs', False) and 'top_logprobs' in body:
+                self.send_error(400, 'logprobs are not supported by this provider')
+                return
             items = self.server.respond(body)
             if items is None:
                 self.send_error(400, 'deliberate model failure')
                 return
-            events = [dict(type='response.output_item.done', item=item) for item in items]
-            events.append(dict(type='response.completed', response=dict(usage=dict(input_tokens=11, output_tokens=7))))
+            events = list(getattr(self.server, 'stream_prefix', []))
+            if getattr(self.server, 'disconnect_once', False):
+                self.server.disconnect_once = False
+            else:
+                events += [dict(type='response.output_item.done', item=item) for item in items]
+                response = dict(usage=dict(input_tokens=11, output_tokens=7))
+                response.update(getattr(self.server, 'response_extra', {}))
+                events.append(dict(type='response.completed', response=response))
             data = ''.join(f'data: {json.dumps(e)}\n\n' for e in events).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
@@ -57,7 +73,7 @@ class Lifecycle(unittest.TestCase):
                      '--store', str(self.dir), '--packages', os.environ['HARNESS_PACKAGES'],
                      '--pool-token-file', os.environ['HARNESS_POOL_TOKEN_FILE'], '--comparator', str(ROOT/'comparator'),
                      '--beam-skill', str(ROOT/'lean-beam/skills/lean-beam'), '--trace', str(self.dir/'trace.jsonl'),
-                     '--base-url', f'http://127.0.0.1:{self.server.server_port}', '--max-turns', '12', '--capture-requests']
+                     '--base-url', f'http://127.0.0.1:{self.server.server_port}', '--max-turns', '12', '--logprobs=false']
 
     def tearDown(self):
         self.server.shutdown()
@@ -66,6 +82,7 @@ class Lifecycle(unittest.TestCase):
         self.temp.cleanup()
 
     def run_harness(self, *extra):
+        # main.rs won't start without a key; the fake server ignores it.
         env = dict(os.environ, DEEPSEEK_API_KEY='local-test-only')
         result = subprocess.run(self.args + list(extra), cwd=ROOT, env=env, text=True, capture_output=True, timeout=150)
         self.assertFalse(self.server.errors, self.server.errors)
@@ -74,7 +91,92 @@ class Lifecycle(unittest.TestCase):
     def records(self):
         return [json.loads(p.read_text()) for p in sorted(self.dir.glob('pool-*/attempts/*/result.json'))]
 
+    def test_default_capture_keeps_reasoning_logprobs_and_interrupted_stream(self):
+        self.args.remove('--logprobs=false')
+        # Vista returns logprobs only in the terminal response, not item.done.
+        # A disconnected first try must also leave its partial reasoning on disk.
+        reasoning = dict(type='reasoning', content=[dict(type='reasoning_text', text='saved reasoning')])
+        message = dict(type='message', role='assistant', content=[dict(type='output_text', text='done')])
+        logprobs = [dict(token='done', logprob=-0.25, bytes=[100, 111, 110, 101], top_logprobs=[])]
+        final = dict(message, content=[dict(type='output_text', text='done', logprobs=logprobs)])
+        self.server.stream_prefix = [dict(type='response.reasoning_text.delta', delta='partial reasoning')]
+        self.server.disconnect_once = True
+        self.server.response_extra = dict(output=[reasoning, final], provider_extension={'retained': True})
+        def respond(body):
+            self.assertIn('message.output_text.logprobs', body['include'])
+            self.assertEqual(body['top_logprobs'], 0)
+            return [reasoning, message]
+        self.server.respond = respond
+        result = self.run_harness()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        row, = self.records()
+        folder = Path(row['candidate']).parent
+        response = json.loads((folder/'response-0001.json').read_text())
+        self.assertEqual(response['items'][0], reasoning)
+        self.assertEqual(response['response']['output'][1]['content'][0]['logprobs'], logprobs)
+        self.assertTrue(response['response']['provider_extension']['retained'])
+        stream = [json.loads(line) for line in (folder/'stream-0001.jsonl').read_text().splitlines()]
+        self.assertEqual([r['try'] for r in stream if r['event'] == 'request'], [1, 2])
+        self.assertTrue(any(r['try'] == 1 and 'partial reasoning' in r.get('data', '') for r in stream))
+        for path in folder.glob('*.json*'):
+            self.assertNotIn('local-test-only', path.read_text(), str(path))
+
+    def test_unsupported_logprobs_are_fatal_and_captured(self):
+        self.args.remove('--logprobs=false')
+        self.server.reject_logprobs = True
+        self.server.respond = lambda _: self.fail('unexpected fallback without logprobs')
+        result = self.run_harness()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        row, = self.records()
+        folder = Path(row['candidate']).parent
+        stream = [json.loads(line) for line in (folder/'stream-0001.jsonl').read_text().splitlines()]
+        requests = [r['body'] for r in stream if r['event'] == 'request']
+        self.assertEqual(row['status'], 'failed')
+        self.assertEqual(len(requests), 1)
+        self.assertIn('top_logprobs', requests[0])
+        self.assertTrue(any(r['event']=='http_error' and r['status']==400 for r in stream))
+        self.assertFalse((folder/'request-0002.json').exists())
+
+    def test_missing_logprobs_fail_before_tools_and_keep_response(self):
+        self.args.remove('--logprobs=false')
+        self.server.respond = lambda _: [call('write_file', {'path': 'Proofs/Solution.lean', 'content': PROOF})]
+        result = self.run_harness()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        row, = self.records()
+        self.assertEqual(row['status'], 'failed')
+        self.assertEqual(row['usage']['output_tokens'], 7)
+        folder = Path(row['candidate']).parent
+        self.assertTrue((folder/'response-0001.json').is_file())
+        self.assertEqual((folder/'candidate.lean').read_bytes(), (ROOT/'examples/simple/Proofs/Solution.lean').read_bytes())
+        trace = [json.loads(line) for line in (self.dir/'trace.jsonl').read_text().splitlines()]
+        self.assertTrue(any(e['event']=='agent_error' and 'logprobs requested' in e['error'] for e in trace))
+        self.assertFalse(any(e['event']=='tool_start' for e in trace))
+
+    def test_logprobs_opt_out_allows_unscored_tools(self):
+        # This fixture explicitly passes --logprobs=false. Missing scores must
+        # not prevent the tool from running or the next model turn from starting.
+        calls = 0
+        def respond(body):
+            nonlocal calls
+            calls += 1
+            self.assertNotIn('top_logprobs', body)
+            self.assertNotIn('message.output_text.logprobs', body['include'])
+            if calls == 1:
+                return [call('write_file', {'path': 'Proofs/Solution.lean', 'content': PROOF})]
+            return [dict(type='message', role='assistant', content=[dict(type='output_text', text='done')])]
+        self.server.respond = respond
+        result = self.run_harness()
+        self.assertEqual(result.returncode, 2, result.stderr)  # No proof was submitted.
+        row, = self.records()
+        self.assertEqual(calls, 2)
+        self.assertEqual(row['status'], 'not_submitted')
+        self.assertEqual(row['termination'], 'no_tool_calls')
+        self.assertEqual(Path(row['candidate']).read_text(), PROOF)
+
     def test_children_order_notes_and_cancellation(self):
+        # The lead's first turn reads, writes and reads again, to check call order.
+        # One child finishes with a note; the other is still sleeping when the lead
+        # stops without submitting and gets cancelled. All three save candidates.
         turns = {}
         observed = []
         def respond(body):
@@ -119,6 +221,7 @@ class Lifecycle(unittest.TestCase):
         self.assertFalse(remaining.strip(), 'orphan containers')
 
     def test_model_failure_keeps_usage_and_candidate(self):
+        # The second request fails with a 400. Usage and the candidate must survive.
         turns = 0
         def respond(_):
             nonlocal turns
@@ -134,6 +237,8 @@ class Lifecycle(unittest.TestCase):
         self.assertTrue(Path(row['candidate']).is_file())
 
     def test_failed_verification_is_recoverable(self):
+        # The template still has sorries, so this fails, but the candidate and
+        # report must still be saved.
         self.server.respond = lambda _: self.fail('verify-only called the model')
         result = self.run_harness('--verify-only', str(ROOT/'examples/simple/Proofs/Solution.lean'))
         self.assertNotEqual(result.returncode, 0)
@@ -145,6 +250,8 @@ class Lifecycle(unittest.TestCase):
 
     @unittest.skipUnless(os.getenv('HARNESS_RETRIEVAL_IMAGE'), 'set HARNESS_RETRIEVAL_IMAGE and start retrieval')
     def test_retrieval_in_sandbox(self):
+        # Local search and Loogle, including a bad query followed by a good one.
+        # The hosted tools are only checked for presence.
         turns = 0
         observed = []
         def respond(body):
@@ -175,6 +282,7 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(Path(record['candidate']).read_bytes(), (ROOT/'examples/simple/Proofs/Solution.lean').read_bytes())
 
     def test_extra_mcp_preserves_its_schema_and_arguments(self):
+        # Only Beam gets `workspace` injected; other servers see it untouched.
         server_code = """import json, sys
 for line in sys.stdin:
     request = json.loads(line)

@@ -2,6 +2,11 @@
 //! `landrun` for the build/export sandbox plus `systemd-run --user` with
 //! `RestrictAddressFamilies=~AF_UNIX` (needed because this kernel's Landlock
 //! cannot scope UNIX sockets).
+//!
+//! worktrees hands us a fresh copy of the trusted template with the candidate
+//! as the only changed file, so nothing from the agent's workspace or build
+//! outputs is used. Build Comparator first with `lake build lean4export
+//! comparator` in its checkout.
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -71,6 +76,8 @@ impl Verifier for Comparator {
                 .map_err(|e| VerifyError::Operational(std::io::Error::other(e.to_string())))?;
         }
         let path = std::env::var("PATH").unwrap_or_default();
+        // Run as a transient unit so RuntimeMaxSec kills the whole process tree.
+        // The unit doesn't inherit our environment, hence the explicit PATH.
         let output = Command::new("systemd-run")
             .args(["--user", "--wait", "--pipe", "--quiet", "--collect"])
             .arg("--property=RestrictAddressFamilies=~AF_UNIX")
@@ -96,7 +103,9 @@ impl Verifier for Comparator {
     }
 }
 
-// A process failure alone is not evidence that the proof was rejected.
+// A nonzero exit alone doesn't mean the proof is wrong. Only output we recognize
+// as a rejection counts as one. Anything else (a crash, a PANIC, setup trouble)
+// is an operational failure, which search.rs retries once.
 fn classify(
     success: bool,
     stdout: &str,
@@ -161,6 +170,8 @@ fn check_theorem_names(template: &Path, config: &str) -> anyhow::Result<()> {
 
 /// Fully qualified names of the theorems in a Lean source, following
 /// `namespace`/`end` nesting.
+/// A line scan, good enough to catch typos in config.json. It misses theorems
+/// with anything in front of the keyword, such as `private theorem`.
 fn declared_theorems(source: &str) -> Vec<String> {
     let mut namespaces: Vec<&str> = Vec::new();
     let mut names = Vec::new();
@@ -185,6 +196,7 @@ fn declared_theorems(source: &str) -> Vec<String> {
     names
 }
 
+// worktrees caps reports at 1 MiB. Keep the end, which is where the verdict is.
 fn tail(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.trim().to_owned();

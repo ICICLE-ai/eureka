@@ -1,47 +1,50 @@
 # Retrieval tools
 
-Optional search MCP for Eureka. Requires the Beam pool image and `harness-agents` network.
-Run from the repository root:
+An optional MCP server that gives Eureka's agents Lean search tools.
+It needs the Beam pool image and the `harness-agents` network from the [pool setup](../../harness/deploy/README.md).
+
+From the repository root, build the agent image and start the shared service:
 
 ```sh
 docker build --target client -t eureka-agent:local tools/retrieval
 docker compose -f tools/retrieval/compose.yaml up -d --build --wait
 ```
 
-Add these arguments to the usual harness command:
+Then add these to the usual harness command:
 
 ```sh
 --image eureka-agent:local --mcp tools/retrieval/mcp.json
 ```
 
-Tools appear as `mcp_retrieval_lean_local_search`, `mcp_retrieval_lean_loogle`,
-`mcp_retrieval_lean_leansearch`, `mcp_retrieval_lean_leanfinder`, and
-`mcp_retrieval_lean_hammer_premise`. Hammer takes one goal's text from Beam
-`lean_goals` as `query`; it returns suggested lemma names.
+## Tools
 
-Local search reads the attempt's source and packages. It is a heuristic source
-search; generated declarations require Beam's `lean_workspace_symbols`.
-The shared service searches a prebuilt Loogle index of the image's Mathlib.
-It rejects requests from a different Lean/Mathlib snapshot. It never mounts
-attempts, proof archives, or the harness store, and never falls back to public Loogle.
+- `mcp_retrieval_lean_local_search`: a heuristic text search over the attempt's own source and packages. It can't find generated declarations; use Beam's `lean_workspace_symbols` for those.
+- `mcp_retrieval_lean_loogle`: Loogle, run by the service against a prebuilt index of the image's Mathlib. It refuses requests from a different Lean/Mathlib snapshot and never falls back to public Loogle.
+- `mcp_retrieval_lean_leansearch` and `mcp_retrieval_lean_leanfinder`: the public LeanSearch and Lean Finder services.
+- `mcp_retrieval_lean_hammer_premise`: a public premise-selection service. Pass one goal's text from Beam's `lean_goals` as `query`; it returns suggested lemma names.
 
-LeanSearch, Lean Finder, and Hammer send query/goal text to their public providers.
-Those indexes may differ from the project's Mathlib; check returned lemmas with Lean.
-Provider outages and rate limits return tool errors, not empty results.
-Limits apply across all attempts. Only the service has outbound internet access;
-its API accepts fixed search operations, never arbitrary URLs or commands.
-It publishes no host port. Keep it on a trusted internal Docker network.
+The three hosted tools send the query or goal text to their providers.
+Their indexes may not match the project's Mathlib, so check any lemma they suggest with Lean.
+Outages and rate limits come back as tool errors rather than empty results, and the rate limits are shared by all attempts.
 
-The service owns one Loogle process (allow 12 GB RAM). The first image build
-compiles Loogle and indexes Mathlib; subsequent starts read that index.
-Changing Beam/Mathlib requires rebuilding both images and extracting matching
-packages as described in [pool setup](../../harness/deploy/README.md).
-Use `--build-arg BEAM_IMAGE=...` for the client and `BEAM_POOL_IMAGE=...`
-for Compose when using a different Beam image.
+## Security
 
-Stop only retrieval with `docker compose -f tools/retrieval/compose.yaml down`.
+Only the service has internet access, and its API runs a fixed set of searches; it never fetches arbitrary URLs or runs commands.
+It doesn't mount attempts, proof archives or the harness store, and it publishes no host port.
+Keep it on a trusted internal Docker network.
 
-Run offline tests with Python 3.12 or later:
+## Resources and rebuilding
+
+The service runs one Loogle process, so give it about 12 GB of RAM.
+The first image build compiles Loogle and indexes Mathlib; later starts reuse that index.
+If you change Beam or Mathlib, rebuild both images and extract matching packages again as described in the [pool setup](../../harness/deploy/README.md).
+To use a different Beam image, pass `--build-arg BEAM_IMAGE=...` when building the client and set `BEAM_POOL_IMAGE=...` for Compose.
+
+To stop just the retrieval service, run `docker compose -f tools/retrieval/compose.yaml down`.
+
+## Tests
+
+The offline tests need Python 3.12 or later:
 
 ```sh
 python3 -m venv tools/retrieval/.venv
@@ -49,12 +52,12 @@ tools/retrieval/.venv/bin/pip install -r tools/retrieval/requirements.txt
 tools/retrieval/.venv/bin/python -m unittest discover -s tools/retrieval/tests -v
 ```
 
-With the pool and retrieval running, set the normal `HARNESS_PACKAGES` and
-`HARNESS_POOL_TOKEN_FILE` test variables, then run:
+There is also an end-to-end test. With the pool and retrieval running, set the usual `HARNESS_PACKAGES` and `HARNESS_POOL_TOKEN_FILE` variables and run:
 
 ```sh
 HARNESS_RETRIEVAL_IMAGE=eureka-agent:local python3 harness/tests/lifecycle.py Lifecycle.test_retrieval_in_sandbox -v
 ```
 
-This test uses scripted model responses and local searches; it makes no paid model calls.
-Upstream code and provider attribution are recorded in [NOTICE](NOTICE).
+It uses scripted model responses and only the local searches, so it costs nothing.
+
+Upstream code and provider attribution are in [NOTICE](NOTICE).

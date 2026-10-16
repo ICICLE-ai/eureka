@@ -13,6 +13,7 @@ node_modules/
 /runs/
 /store/
 /pool-packages/
+/pool-packages-tapis/
 *.jsonl
 *.log
 request-*.json
