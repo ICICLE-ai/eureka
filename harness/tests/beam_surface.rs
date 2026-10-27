@@ -50,9 +50,7 @@ fn mcp_binary() -> Option<PathBuf> {
 }
 
 async fn call(beam: &Beam, _root: &Path, name: &str, args: Value) -> Value {
-    // MCP errors come back as text starting with ERROR (see beam::render).
     let text = beam.call(name, &args).await.unwrap();
-    assert!(!text.starts_with("ERROR"), "{name} failed: {text}");
     serde_json::from_str(&text).unwrap_or_else(|_| panic!("{name} returned non-JSON: {text}"))
 }
 

@@ -90,23 +90,27 @@ class TraceReader:
             return  # Run-level usage would double-count these same attempts.
         row = self.attempts.setdefault(name, dict(
             id=name, label=name, status='unfinished', turns=0, tool_calls=0,
-            input=0, cached=0, output=0, errors=0, incomplete=0))
+            compactions=0, input=0, cached=0, output=0, errors=0, incomplete=0))
         kind = event.get('event')
         row['last_ms'] = event.get('ts_ms', 0)
         if kind == 'attempt_start':
             row['label'] = event.get('label', name)
             row['artifacts'] = event.get('artifacts')
-        elif kind in ('model_start', 'tool_start'):
-            row['active'] = event.get('name', 'model')
-        elif kind == 'model':
+        elif kind in ('model_start', 'tool_start', 'compaction_start'):
+            row['active'] = 'compaction' if kind == 'compaction_start' else event.get('name', 'model')
+        elif kind in ('model', 'compaction_model'):
             row['active'] = None
-            row['turns'] = event.get('turn', row['turns'] + 1)
+            if kind == 'model':
+                row['turns'] = event.get('turn', row['turns'] + 1)
             row['incomplete'] += bool(event.get('incomplete'))
             usage = event.get('usage', {})
             # Cumulative completed-turn usage, not context size. Cached is in input.
             for column, field in [('input', 'input_tokens'), ('cached', 'cached_input_tokens'),
                                   ('output', 'output_tokens')]:
                 row[column] += usage.get(field, 0)
+        elif kind == 'compaction':
+            row['compactions'] += 1
+            row['active'] = None
         elif kind == 'tool':
             row['active'] = None
             row['tool_calls'] += 1
@@ -139,6 +143,7 @@ def print_plain(reports):
         for row in report['attempts']:
             active = f"; waiting on {row['active']}" if row.get('active') else ''
             print(f"  {row['id']} ({row['label']}): {row['status']}; turns={row['turns']}; "
+                  f"compactions={row['compactions']}; "
                   f"tokens={row['input']}/{row['cached']}/{row['output']} in/cached/out; "
                   f"tool calls={row['tool_calls']}; tool errors={row['errors']}; "
                   f"incomplete={row['incomplete']}{active}; last event {row['seconds_since_event']}s ago")
@@ -159,7 +164,7 @@ def dashboard(reports, width=120):
     table = Table(title='Eureka · proof runs', header_style='bold', box=None, padding=(0, 1))
     table.add_column('Run / agent', max_width=20 if narrow else 40, no_wrap=True, overflow='ellipsis')
     table.add_column('Status', min_width=10, no_wrap=True, overflow='ellipsis')
-    for name in ('Turn', 'Tools', 'Output' if narrow else 'Input / cached / output', 'Err'):
+    for name in ('Turn', 'Cmp', 'Tools', 'Output' if narrow else 'Input / cached / output', 'Err'):
         table.add_column(name, justify='right', min_width=len(name), no_wrap=True)
     table.add_column('Waiting on', max_width=12 if narrow else 24, no_wrap=True, overflow='ellipsis')
     table.add_column('Age', justify='right', min_width=4, no_wrap=True)
@@ -187,7 +192,7 @@ def dashboard(reports, width=120):
             table.add_row(
                 Text(f"{label}/{row['label']} #{number}"),
                 Text(row['status'], style=STATUS_STYLES.get(row['status'], 'dim')),
-                str(row['turns']), str(row['tool_calls']), tokens,
+                str(row['turns']), str(row['compactions']), str(row['tool_calls']), tokens,
                 Text(str(row['errors']), style='bold red' if row['errors'] else 'dim'),
                 Text(row.get('active') or '—', style='cyan'),
                 Text(f"{row['seconds_since_event']}s", style='dim'))

@@ -183,6 +183,8 @@ fn declared_theorems(source: &str) -> Vec<String> {
                 namespaces.pop();
             }
             (Some("theorem" | "lemma"), Some(name)) => {
+                // Lean permits `theorem t:` and `lemma t(n : Nat)` without a space.
+                let name = name.split([':', '(', '{', '[']).next().unwrap_or(name);
                 let prefix = namespaces.join(".");
                 names.push(if prefix.is_empty() {
                     name.to_owned()
@@ -240,5 +242,24 @@ mod tests {
     fn theorems_are_qualified_by_namespace() {
         let src = "import Mathlib\nnamespace TriangleGame\ndef x := 1\ntheorem main_theorem : True := by\n  sorry\nend TriangleGame\nlemma top : True := trivial\n";
         assert_eq!(declared_theorems(src), ["TriangleGame.main_theorem", "top"]);
+    }
+
+    #[test]
+    fn theorem_names_stop_before_attached_punctuation() {
+        let src = "theorem putnam_1993_b5:\n  True := by trivial\n\
+                   namespace N\nlemma direct:True := by trivial\n\
+                   theorem bound(n : Nat) : n = n := rfl\n\
+                   theorem implicit{n : Nat} : n = n := rfl\n\
+                   theorem instance[T : Type] : True := by trivial\nend N\n";
+        assert_eq!(
+            declared_theorems(src),
+            [
+                "putnam_1993_b5",
+                "N.direct",
+                "N.bound",
+                "N.implicit",
+                "N.instance",
+            ]
+        );
     }
 }

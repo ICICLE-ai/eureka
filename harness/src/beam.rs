@@ -76,9 +76,9 @@ impl Beam {
         &self.tools
     }
 
-    /// Call `name` for this attempt. Returns the tool's text result; `Err` only
-    /// for bad arguments or transport failures. Lean-level failures come back
-    /// as text so the model can read them.
+    /// Call `name` for this attempt. MCP tool and transport errors return `Err`.
+    /// Ordinary Lean diagnostics stay in the successful tool result, including
+    /// probes whose Lean code does not compile.
     pub async fn call(&self, name: &str, args: &Value) -> Result<String> {
         let mut arguments: Map<String, Value> = match args {
             Value::Object(m) => m.clone(),
@@ -95,8 +95,7 @@ impl Beam {
             .call_tool(params)
             .await
             .with_context(|| format!("MCP call {name}"))?;
-        let text = render(&serde_json::to_value(&result)?);
-        Ok(text)
+        render(&serde_json::to_value(&result)?).with_context(|| format!("MCP tool {name}"))
     }
 }
 
@@ -125,25 +124,25 @@ fn to_spec(tool: &Tool, beam: bool) -> ToolSpec {
 }
 
 /// Flatten an MCP tool result into text: structured content when present,
-/// otherwise the concatenated text parts. Errors are prefixed with `ERROR`
-/// so the model can't mistake them for success.
-fn render(result: &Value) -> String {
-    let mut out = String::new();
-    if result.get("isError") == Some(&Value::Bool(true)) {
-        out.push_str("ERROR: ");
-    }
-    if let Some(structured) = result.get("structuredContent").filter(|v| !v.is_null()) {
-        out.push_str(&serde_json::to_string(structured).unwrap_or_default());
-        return out;
-    }
-    if let Some(parts) = result.get("content").and_then(Value::as_array) {
-        for part in parts {
-            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                out.push_str(text);
+/// otherwise the concatenated text parts. Preserve MCP's error flag across
+/// this boundary so callers such as `lean_check` cannot hide a failed tool
+/// inside an otherwise successful JSON reply.
+fn render(result: &Value) -> Result<String> {
+    let out = if let Some(structured) = result.get("structuredContent").filter(|v| !v.is_null()) {
+        serde_json::to_string(structured)?
+    } else {
+        let mut out = String::new();
+        if let Some(parts) = result.get("content").and_then(Value::as_array) {
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    out.push_str(text);
+                }
             }
         }
-    }
-    out
+        out
+    };
+    anyhow::ensure!(result.get("isError") != Some(&Value::Bool(true)), "{out}");
+    Ok(out)
 }
 
 /// A Beam server from a host install, for tests and local experiments.
@@ -159,12 +158,26 @@ mod tests {
     #[test]
     fn render_prefers_structured_and_marks_errors() {
         let ok = json!({"content": [{"type": "text", "text": "{\"ok\":true}"}]});
-        assert_eq!(render(&ok), "{\"ok\":true}");
+        assert_eq!(render(&ok).unwrap(), "{\"ok\":true}");
         let structured =
             json!({"content": [{"type": "text", "text": "x"}], "structuredContent": {"goals": []}});
-        assert_eq!(render(&structured), "{\"goals\":[]}");
+        assert_eq!(render(&structured).unwrap(), "{\"goals\":[]}");
         let err = json!({"isError": true, "content": [{"type": "text", "text": "bad"}]});
-        assert_eq!(render(&err), "ERROR: bad");
+        assert_eq!(render(&err).unwrap_err().to_string(), "bad");
+        let err = json!({"isError": true, "structuredContent": {
+            "code": "internalError", "message": "too many open files"
+        }});
+        assert!(
+            render(&err)
+                .unwrap_err()
+                .to_string()
+                .contains("too many open files")
+        );
+        // A rejected proof is still a completed probe, with useful diagnostics.
+        let rejected = json!({"isError": false, "structuredContent": {
+            "success": false, "messages": [{"severity": "error", "text": "unknown constant"}]
+        }});
+        assert!(render(&rejected).unwrap().contains("unknown constant"));
     }
 }
 

@@ -73,6 +73,13 @@ prompt = (
 # Keep long reports below Linux's per-argument limit when passed through --prompt.
 prompt += "\nPrevious handoff (last 12000 characters):\n" + handoff[-12000:]
 prompt += "\n\nVerifier feedback (last 12000 characters):\n" + feedback[-12000:]
+summaries = list(artifacts.glob("compaction-*/handoff.txt"))
+if summaries:
+    latest = max(summaries, key=lambda p: int(p.parent.name.removeprefix("compaction-")))
+    # Keep the combined prompt below Linux's per-argument byte limit, including Unicode.
+    prompt += ("\n\nLast compaction handoff (last 4000 characters; unverified):\n"
+               + latest.read_text()[-4000:]
+               + "\nHelpers from the previous run have stopped; their old IDs are no longer active.\n")
 # candidate.lean is frozen after all tools stop, including edits made through shell.
 # The last write_file event alone may be older than that final state.
 metadata = {

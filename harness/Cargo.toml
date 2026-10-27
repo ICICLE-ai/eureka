@@ -21,3 +21,7 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs", "io-util", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+# Advance the clock in streaming timeout tests without waiting 30 real minutes.
+tokio = { version = "1", features = ["net", "test-util"] }

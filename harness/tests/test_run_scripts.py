@@ -1,6 +1,9 @@
 """Exercise stop PID checks without a model, Docker, or a real proof run."""
 from pathlib import Path
+import hashlib
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -67,6 +70,39 @@ class RunScripts(unittest.TestCase):
                 result = self.stop()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('invalid PID', result.stderr)
+
+    def test_restart_keeps_latest_compaction_and_saved_proof(self):
+        # Exercise the real restart script. Only launching the harness is stubbed.
+        root = Path(self.temp.name)
+        scripts = root / 'scripts'
+        scripts.mkdir()
+        shutil.copy2(ROOT / 'scripts/restart.sh', scripts / 'restart.sh')
+        (scripts / 'env.sh').write_text(f"ROOT={str(root)!r}\nneed_harness() {{ :; }}\n")
+        launch = scripts / 'run.sh'
+        launch.write_text('#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n'
+                          'p=Path(sys.argv[2]);p.mkdir()\n'
+                          '(p/"launch.json").write_text(json.dumps(sys.argv[1:]))\n')
+        launch.chmod(0o755)
+        pool = self.run / 'store/pool-fixture'
+        (pool / 'source').mkdir(parents=True)
+        attempt = pool / 'attempts/attempt-000001'
+        attempt.mkdir(parents=True)
+        (attempt / 'candidate.lean').write_text('saved proof state')
+        (attempt / 'result.json').write_text(json.dumps({'status': 'not_submitted',
+            'last_message': 'recent plan', 'detail': 'verifier feedback'}))
+        for number, text in [(20, 'older summary'), (10000, 'newest summary')]:
+            directory = attempt / f'compaction-{number:04}'
+            directory.mkdir()
+            (directory / 'handoff.txt').write_text(text)
+        new = root / 'new'
+        result = subprocess.run([str(scripts / 'restart.sh'), str(self.run), str(new)],
+                                 capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = json.loads((new / 'restart.json').read_text())
+        self.assertIn('newest summary', metadata['prompt'])
+        self.assertNotIn('older summary', metadata['prompt'])
+        self.assertIn('old IDs are no longer active', metadata['prompt'])
+        self.assertEqual(metadata['seed_sha256'], hashlib.sha256(b'saved proof state').hexdigest())
 
 
 if __name__ == '__main__':

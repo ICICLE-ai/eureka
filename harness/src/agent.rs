@@ -4,13 +4,13 @@
 //! verification afterwards. `run` returns an Outcome even when the model fails,
 //! so the caller can still save the target file.
 //!
-//! History is append-only so the provider's prefix cache keeps hitting. With
-//! `--cache-dir`, every request is also memoized on disk, keyed by its exact
-//! body, which makes reruns and tests free.
+//! History is append-only between compactions so prefix caching keeps working. With
+//! `--cache-dir`, proof requests are also memoized on disk, keyed by their exact
+//! bodies. Compaction summaries are captured with their own artifacts.
 
-use crate::responses::{Client, Completion, Item, Usage, parse_arguments};
+use crate::responses::{Client, Completion, ContextLengthExceeded, Item, Usage, parse_arguments};
 use crate::tools::{Ctx, Tool, definition};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -24,6 +24,8 @@ pub struct AgentConfig {
     pub max_turns: usize,
     pub cache_dir: Option<PathBuf>,
     pub capture_requests: bool,
+    /// A text-only reply is a continuation, not permission to abandon the task.
+    pub dont_give_up: bool,
 }
 
 #[derive(Debug, Default)]
@@ -84,6 +86,9 @@ async fn run_loop(
 ) -> Result<()> {
     let specs: Vec<Value> = tools.iter().map(|t| definition(&t.spec())).collect();
     let mut items = vec![Item::user(prompt)];
+    let mut requests = 0;
+    let mut compactions = 0;
+    let mut compacted_since_response = false;
 
     while outcome.turns < config.max_turns {
         if ctx.stop.is_cancelled() {
@@ -92,16 +97,15 @@ async fn run_loop(
         }
         ctx.trace.check()?;
         outcome.turns += 1;
+        requests += 1;
         let body = client.body(instructions, &items, &specs, Some(&ctx.id));
         let started = Instant::now();
-        let request_file = ctx
-            .artifacts
-            .join(format!("request-{:04}.json", outcome.turns));
+        let request_file = ctx.artifacts.join(format!("request-{requests:04}.json"));
         if config.capture_requests {
             // The API key is sent as a header, so the body is safe to save.
             crate::trace::artifact(&request_file, &serde_json::to_vec(&body)?)?;
         }
-        ctx.trace.event(&ctx.id, "model_start", json!({"turn": outcome.turns, "request": config.capture_requests.then_some(&request_file)}));
+        ctx.trace.event(&ctx.id, "model_start", json!({"turn": outcome.turns, "request_number": requests, "request": config.capture_requests.then_some(&request_file)}));
         let (completion, cached) = match cached_completion(config, &body, client.endpoint()) {
             Some(c) => (c, true),
             None => {
@@ -109,8 +113,7 @@ async fn run_loop(
                     .capture_requests
                     .then(|| {
                         crate::trace::Trace::open(
-                            &ctx.artifacts
-                                .join(format!("stream-{:04}.jsonl", outcome.turns)),
+                            &ctx.artifacts.join(format!("stream-{requests:04}.jsonl")),
                         )
                     })
                     .transpose()?;
@@ -118,25 +121,49 @@ async fn run_loop(
                     biased;
                     // Check cancellation first so a stopped attempt doesn't take another turn.
                     _ = ctx.stop.cancelled() => { outcome.termination = "cancelled".into(); break; }
-                    result = client.complete(&body, &ctx.trace, &ctx.id, capture.as_ref()) => result?,
+                    result = client.complete(&body, &ctx.trace, &ctx.id, capture.as_ref()) => result,
+                };
+                let c = match c {
+                    Ok(c) => c,
+                    Err(error)
+                        if error.is::<ContextLengthExceeded>() && !compacted_since_response =>
+                    {
+                        compactions += 1;
+                        items = tokio::select! {
+                            biased;
+                            _ = ctx.stop.cancelled() => { outcome.termination = "cancelled".into(); break; }
+                            result = crate::compaction::compact(client, &body, ctx,
+                                compactions, config.capture_requests, &mut outcome.usage) => result?,
+                        };
+                        compacted_since_response = true;
+                        // A rejected request did no proof work. Unique request
+                        // numbers retain it without spending the agent's turn budget.
+                        outcome.turns -= 1;
+                        continue;
+                    }
+                    Err(error) if error.is::<ContextLengthExceeded>() => {
+                        return Err(error)
+                            .context("compacted conversation still exceeds the context window");
+                    }
+                    Err(error) => return Err(error),
                 };
                 store_completion(config, &body, &c, client.endpoint());
                 (c, false)
             }
         };
+        compacted_since_response = false;
         outcome.usage.add(&completion.usage);
+        let response_file = ctx.artifacts.join(format!("response-{requests:04}.json"));
         if config.capture_requests {
-            crate::trace::artifact(
-                &ctx.artifacts
-                    .join(format!("response-{:04}.json", outcome.turns)),
-                &serde_json::to_vec(&completion)?,
-            )?;
+            crate::trace::artifact(&response_file, &serde_json::to_vec(&completion)?)?;
         }
         ctx.trace.event(
             &ctx.id,
             "model",
             json!({
                 "turn": outcome.turns, "ms": started.elapsed().as_millis(), "cached_response": cached,
+                "request_number": requests, "request": config.capture_requests.then_some(&request_file),
+                "response": config.capture_requests.then_some(&response_file),
                 "usage": completion.usage, "items": completion.items.len(), "incomplete": completion.incomplete,
                 "text": completion.items.iter().filter_map(Item::assistant_text).collect::<Vec<_>>().join("\n"),
             }),
@@ -175,6 +202,14 @@ async fn run_loop(
                 items.push(Item::user(format!(
                     "Your previous turn stopped early ({reason}) before calling any tool. Continue from where you were, keep reasoning brief, and act with tools in small steps."
                 )));
+                continue;
+            }
+            if config.dont_give_up {
+                items.push(Item::user(
+                    "Continue the assigned proof work with tools. A narrative reply does not finish \
+                     the task. Use submit when the whole proof is ready, or finish to return your \
+                     assigned helper work. Do not give up or claim success without verification.",
+                ));
                 continue;
             }
             // A reply with no tool calls ends the attempt without a submission.
