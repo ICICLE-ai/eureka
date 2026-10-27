@@ -214,10 +214,33 @@ enum Attempt {
     Retry(String),
 }
 
+/// Retrying the same body cannot fix this. The agent must compact its history.
+#[derive(Debug)]
+pub struct ContextLengthExceeded(String);
+
+impl std::fmt::Display for ContextLengthExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ContextLengthExceeded {}
+
+fn context_length_exceeded(error: &Value) -> bool {
+    error["code"].as_str() == Some("context_length_exceeded")
+        || (error["param"].as_str() == Some("input_tokens")
+            && error["message"]
+                .as_str()
+                .is_some_and(|s| s.contains("maximum context length")))
+}
+
 impl Client {
     pub fn new(config: ModelConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
+            // Also bound silent waits for headers and HTTP error bodies. Each
+            // successful read resets this timer; it is not a total deadline.
+            .read_timeout(config.idle_timeout)
             .build()?;
         Ok(Self { http, config })
     }
@@ -280,23 +303,16 @@ impl Client {
                 tokio::time::sleep(backoff(attempt)).await;
             }
             trace.event(id, "request_start", serde_json::json!({"try": attempt + 1}));
-            // The idle timeout won't catch a stream that keeps trickling, so each
-            // try is also capped at 30 minutes.
             capture_event(
                 capture,
                 id,
                 "request",
                 serde_json::json!({"try": attempt + 1, "body": body}),
             )?;
-            let response = match tokio::time::timeout(
-                Duration::from_secs(1800),
-                self.once(body, capture, id, attempt + 1),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Ok(Attempt::Retry("request deadline exceeded".into())),
-            };
+            // Long reasoning can stream for more than 30 minutes. Let the
+            // output-token limit bound it; only silence should time out here.
+            // agent.rs can still cancel the request when the run is stopped.
+            let response = self.once(body, capture, id, attempt + 1).await;
             trace.event(id, "request_end", serde_json::json!({"try": attempt + 1, "error": response.as_ref().err().map(|e| format!("{e:#}"))}));
             match response? {
                 Attempt::Done(c) => return Ok(c),
@@ -347,7 +363,13 @@ impl Client {
             if status.as_u16() == 429 || status.is_server_error() {
                 return Ok(Attempt::Retry(format!("HTTP {status}: {text}")));
             }
-            // Other errors (bad key, context too long) won't succeed on a retry.
+            if status.as_u16() == 400
+                && serde_json::from_str::<Value>(&text)
+                    .is_ok_and(|body| context_length_exceeded(&body["error"]))
+            {
+                return Err(ContextLengthExceeded(format!("HTTP {status}: {text}")).into());
+            }
+            // Bad credentials/configuration remain fatal; never hide an arbitrary 400.
             bail!("HTTP {status}: {text}");
         }
 
@@ -432,6 +454,11 @@ impl Client {
                     }));
                 }
                 "response.failed" => {
+                    if let Some(error) = event.response.as_ref().and_then(|r| r.get("error"))
+                        && context_length_exceeded(error)
+                    {
+                        return Err(ContextLengthExceeded(error.to_string()).into());
+                    }
                     let message = event
                         .response
                         .as_ref()
@@ -441,6 +468,11 @@ impl Client {
                     return Ok(Attempt::Retry(message.to_owned()));
                 }
                 "error" => {
+                    if let Some(error) = &event.error
+                        && context_length_exceeded(error)
+                    {
+                        return Err(ContextLengthExceeded(error.to_string()).into());
+                    }
                     // Remember the message in case the stream closes next.
                     failure = Some(
                         event
@@ -508,6 +540,23 @@ pub fn parse_arguments(arguments: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_context_errors_trigger_compaction() {
+        assert!(context_length_exceeded(
+            &serde_json::json!({"code":"context_length_exceeded"})
+        ));
+        assert!(context_length_exceeded(&serde_json::json!({
+            "code":400, "param":"input_tokens", "message":"This model's maximum context length is 1048576 tokens."
+        })));
+        for error in [
+            serde_json::json!({"code":400,"param":"model","message":"unknown model"}),
+            serde_json::json!({"param":"input_tokens","message":"invalid input"}),
+            Value::Null,
+        ] {
+            assert!(!context_length_exceeded(&error));
+        }
+    }
 
     #[test]
     fn items_round_trip_and_keep_unknown_fields() {

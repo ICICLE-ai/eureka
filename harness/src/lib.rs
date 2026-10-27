@@ -16,6 +16,7 @@
 
 pub mod agent;
 pub mod beam;
+mod compaction;
 pub mod deps;
 pub mod lean_text;
 pub mod pool;

@@ -26,6 +26,15 @@ def call(name, args):
     return dict(type='function_call', call_id=f'call-{name}', name=name, arguments=json.dumps(args))
 
 
+def message(text):
+    return dict(type='message', role='assistant', content=[dict(type='output_text', text=text)])
+
+
+def context_error():
+    return {'error': {'code': 'context_length_exceeded', 'param': 'input_tokens',
+                      'message': "This model's maximum context length was exceeded."}}
+
+
 class Model(BaseHTTPRequestHandler):
     # Fake /responses endpoint. Each test scripts the replies with server.respond.
     def log_message(self, *_):
@@ -38,6 +47,14 @@ class Model(BaseHTTPRequestHandler):
                 self.send_error(400, 'logprobs are not supported by this provider')
                 return
             items = self.server.respond(body)
+            if isinstance(items, dict) and 'error' in items:
+                data = json.dumps(items).encode()
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if items is None:
                 self.send_error(400, 'deliberate model failure')
                 return
@@ -55,6 +72,8 @@ class Model(BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        except BrokenPipeError:
+            pass  # A cancellation test deliberately closes the streaming request.
         except Exception as error:
             self.server.errors.append(error)
             self.send_error(500)
@@ -236,6 +255,150 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(row['usage']['output_tokens'], 7)
         self.assertTrue(Path(row['candidate']).is_file())
 
+    def test_long_lived_agent_compacts_twenty_times_and_does_not_give_up(self):
+        # Real HTTP, filesystem snapshots, sandbox and final Comparator check.
+        # Summaries do not reset the lifetime turn budget, file or tool state.
+        normal, summaries, overflow = 0, 0, False
+        original = None
+        def respond(body):
+            nonlocal normal, summaries, overflow, original
+            if body['tool_choice'] == 'none':
+                summaries += 1
+                self.assertLessEqual(body['max_output_tokens'], 8192)
+                if summaries > 1:
+                    self.assertIn(f'handoff-{summaries - 1}', json.dumps(body['input']))
+                return [message(f'handoff-{summaries}: the saved file contains the proof.')]
+            if overflow:
+                overflow = False
+                return context_error()
+            if original is None:
+                original = body
+            self.assertEqual(body['instructions'], original['instructions'])
+            self.assertEqual(body['tools'], original['tools'])
+            self.assertEqual(body['input'][0], original['input'][0])
+            if summaries and normal % 100 == 0:
+                self.assertEqual(len(body['input']), 2)
+                self.assertIn(f'handoff-{summaries}', json.dumps(body['input']))
+            normal += 1
+            overflow = normal % 100 == 0
+            if normal == 1:
+                return [call('write_file', {'path': 'Proofs/Solution.lean', 'content': PROOF})]
+            if normal == 2001:
+                return [call('submit', {'note': 'complete after twenty compactions'})]
+            return [message('I need to continue working.')]
+        self.server.respond = respond
+        self.args[self.args.index('--max-turns') + 1] = '2001'
+        result = self.run_harness('--dont-give-up')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((normal, summaries), (2001, 20))
+        row, = self.records()
+        self.assertEqual(row['turns'], 2001)
+        self.assertEqual(row['status'], 'verified')
+        self.assertEqual(row['usage']['input_tokens'], 2021 * 11)
+        folder = Path(row['candidate']).parent
+        self.assertEqual(len(list(folder.glob('request-*.json'))), 2021)
+        self.assertEqual(len(list(folder.glob('response-*.json'))), 2001)
+        compactions = sorted(folder.glob('compaction-*'))
+        self.assertEqual(len(compactions), 20)
+        for directory in compactions:
+            self.assertEqual((directory/'candidate.lean').read_text(), PROOF)
+            for filename in ['history.json', 'handoff.txt', 'summary-1-request.json',
+                             'summary-1-response.json', 'summary-1-stream.jsonl']:
+                self.assertTrue((directory/filename).is_file(), filename)
+
+    def test_summary_can_recover_when_full_history_does_not_fit_either(self):
+        normal, summaries = 0, 0
+        def respond(body):
+            nonlocal normal, summaries
+            if body['tool_choice'] == 'none':
+                summaries += 1
+                if summaries == 1:
+                    return context_error()
+                self.assertEqual(len(body['input']), 1)
+                self.assertLess(len(body['input'][0]['content'][0]['text'].encode()), 66_000)
+                return [message('The file is ready; reread it.')]
+            normal += 1
+            if normal == 1:
+                return [message('λ' * 60_000), call('write_file', {
+                    'path': 'Proofs/Solution.lean', 'content': PROOF})]
+            if normal == 2:
+                return context_error()
+            self.assertEqual(len(body['input']), 2)
+            return [call('read_file', {'path': 'Proofs/Solution.lean'})]
+        self.server.respond = respond
+        self.args[self.args.index('--max-turns') + 1] = '2'
+        result = self.run_harness()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        row, = self.records()
+        self.assertEqual(row['termination'], 'turn_limit')
+        self.assertEqual(summaries, 2)
+        self.assertEqual(Path(row['candidate']).read_text(), PROOF)
+        events = [json.loads(line) for line in (self.dir/'trace.jsonl').read_text().splitlines()]
+        for event in events:
+            if event['event'] in ('model', 'compaction_model'):
+                self.assertTrue(Path(event['request']).is_file())
+                self.assertTrue(Path(event['response']).is_file())
+
+    def test_compacted_input_that_still_cannot_fit_fails_without_looping(self):
+        calls = []
+        def respond(body):
+            calls.append(body['tool_choice'])
+            return [message('handoff')] if body['tool_choice'] == 'none' else context_error()
+        self.server.respond = respond
+        result = self.run_harness()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(calls, ['auto', 'none', 'auto'])
+        row, = self.records()
+        self.assertEqual(row['status'], 'failed')
+        self.assertIn('compacted conversation still exceeds', row['detail'])
+
+    def test_compaction_keeps_logprobs_requirement(self):
+        self.args.remove('--logprobs=false')
+        calls = []
+        def respond(body):
+            calls.append(body['tool_choice'])
+            if body['tool_choice'] == 'none':
+                self.assertIn('top_logprobs', body)
+                return [message('handoff without requested scores')]
+            return context_error()
+        self.server.respond = respond
+        result = self.run_harness()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(calls, ['auto', 'none'])
+        row, = self.records()
+        self.assertIn('logprobs requested', row['detail'])
+
+    def test_stopping_during_compaction_saves_the_current_proof(self):
+        waiting, release = threading.Event(), threading.Event()
+        normal = 0
+        def respond(body):
+            nonlocal normal
+            if body['tool_choice'] == 'none':
+                waiting.set()
+                release.wait(60)
+                return [message('unused handoff')]
+            normal += 1
+            if normal == 1:
+                return [call('write_file', {'path': 'Proofs/Solution.lean', 'content': PROOF})]
+            return context_error()
+        self.server.respond = respond
+        process = subprocess.Popen(self.args, cwd=ROOT,
+            env=dict(os.environ, DEEPSEEK_API_KEY='local-test-only'),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertTrue(waiting.wait(60), 'did not start compaction')
+            process.terminate()
+            _, stderr = process.communicate(timeout=60)
+            self.assertEqual(process.returncode, 2, stderr)
+            row, = self.records()
+            self.assertEqual(row['termination'], 'cancelled')
+            self.assertEqual(Path(row['candidate']).read_text(), PROOF)
+        finally:
+            release.set()
+            if process.poll() is None:
+                process.terminate()
+                process.communicate(timeout=60)
+
     def test_failed_verification_is_recoverable(self):
         # The template still has sorries, so this fails, but the candidate and
         # report must still be saved.
@@ -293,7 +456,8 @@ for line in sys.stdin:
     elif method == 'tools/list':
         result = {'tools': [{'name': 'echo', 'inputSchema': {'type': 'object', 'properties': {'workspace': {'type': 'string'}}, 'required': ['workspace']}}]}
     elif method == 'tools/call':
-        result = {'content': [{'type': 'text', 'text': request['params']['arguments']['workspace']}]}
+        text = request['params']['arguments']['workspace']
+        result = {'isError': text == 'fixture failure', 'content': [{'type': 'text', 'text': text}]}
     else: result = {}
     print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
 """
@@ -302,14 +466,25 @@ for line in sys.stdin:
         def respond(body):
             tool = next(t for t in body['tools'] if t['name'] == 'mcp_fixture_echo')
             self.assertIn('workspace', tool['parameters']['properties'])
-            return [call('mcp_fixture_echo', {'workspace': 'preserved'})]
+            return [call('mcp_fixture_echo', {'workspace': 'preserved'}),
+                    call('mcp_fixture_echo', {'workspace': 'fixture failure'}),
+                    call('lean_check', {'commands': ['#check Nat.add_comm', '#check missing_fixture_name']})]
         self.server.respond = respond
         self.args[self.args.index('--max-turns') + 1] = '1'
         result = self.run_harness('--mcp', str(config))
         self.assertEqual(result.returncode, 2, result.stderr)
         events = [json.loads(line) for line in (self.dir/'trace.jsonl').read_text().splitlines()]
-        output, = [e['output'] for e in events if e['event'] == 'tool']
-        self.assertEqual(output, 'preserved')
+        outputs = [e for e in events if e['event'] == 'tool']
+        self.assertEqual(outputs[0]['output'], 'preserved')
+        self.assertFalse(outputs[0]['error'])
+        self.assertTrue(outputs[1]['error'])
+        self.assertTrue(outputs[1]['output'].startswith('ERROR:'))
+        self.assertIn('fixture failure', outputs[1]['output'])
+        # Lean diagnostics are completed probes. They must not be counted as MCP failures.
+        self.assertFalse(outputs[2]['error'], outputs[2])
+        probes = json.loads(outputs[2]['output'])
+        self.assertTrue(probes[0]['success'], probes)
+        self.assertFalse(probes[1]['success'], probes)
 
     def test_saved_proof_can_be_reverified_and_published(self):
         self.server.respond = lambda _: self.fail('verify-only called the model')

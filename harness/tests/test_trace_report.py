@@ -84,6 +84,19 @@ class TraceReaderTests(unittest.TestCase):
         self.assertEqual(second['attempts'][0]['seconds_since_event'], 6)
         self.assertEqual(second['attempts'][0]['status'], 'unfinished')
 
+    def test_compaction_tokens_are_counted_without_incrementing_proof_turns(self):
+        self.path.write_text(self.event('model', turn=100, usage={'input_tokens': 50}) +
+                             self.event('compaction_start'))
+        self.assertEqual(self.reader.read()['attempts'][0]['active'], 'compaction')
+        with self.path.open('a') as stream:
+            stream.write(self.event('compaction_model', usage={
+                'input_tokens': 20, 'cached_input_tokens': 10, 'output_tokens': 5}))
+            stream.write(self.event('compaction'))
+        row, = self.reader.read()['attempts']
+        self.assertEqual((row['turns'], row['input'], row['cached'], row['output']),
+                         (100, 70, 10, 5))
+        self.assertEqual(row['compactions'], 1)
+
     def test_json_works_without_site_packages_and_never_has_color(self):
         self.path.write_text(self.event('attempt_start'))
         result = subprocess.run([sys.executable, '-S', str(SCRIPT), str(self.path),

@@ -8,7 +8,7 @@ use crate::beam::{Beam, ToolSpec};
 use crate::lean_text::{command_line, tactic_block};
 use crate::sandbox::Sandbox;
 use crate::trace::Trace;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -290,19 +290,22 @@ impl Tool for LeanCheck {
                     .call("lean_run_at",
                         &json!({"path": path, "version": version, "line": line, "character": 0, "text": text}),
                     )
-                    .await;
+                    .await
+                    .with_context(|| format!("lean_check command {text:?}"))?;
                 // Keep only what the model needs: the command, success flag and messages.
-                match out {
-                    Ok(out) => match serde_json::from_str::<Value>(&out) {
-                        Ok(v) if v.get("messages").is_some() => {
-                            json!({"command": text, "success": v["success"], "messages": v["messages"]})
-                        }
-                        _ => json!({"command": text, "raw": truncate(out)}),
-                    },
-                    Err(e) => json!({"command": text, "error": format!("{e:#}")}),
-                }
+                Ok::<_, anyhow::Error>(match serde_json::from_str::<Value>(&out) {
+                    Ok(v) if v.get("messages").is_some() => {
+                        json!({"command": text, "success": v["success"], "messages": v["messages"]})
+                    }
+                    _ => json!({"command": text, "raw": truncate(out)}),
+                })
             });
-            let results: Vec<Value> = futures::future::join_all(probes).await;
+            // Drain every probe before returning an infrastructure error. Ordinary
+            // Lean failures remain `success: false` results for the model to inspect.
+            let results: Vec<Value> = futures::future::join_all(probes)
+                .await
+                .into_iter()
+                .collect::<Result<_>>()?;
             Ok(truncate(serde_json::to_string(&results)?))
         })
     }

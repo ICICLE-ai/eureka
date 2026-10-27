@@ -106,7 +106,7 @@ struct Cli {
     /// Override the first user message given to each top-level agent.
     #[arg(long)]
     prompt: Option<String>,
-    /// Tell the agents the statement is known to be provable and that giving up is not an option.
+    /// Continue text-only replies until submit/finish or the turn limit; encourage persistence.
     #[arg(long)]
     dont_give_up: bool,
 }
@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
         effort: cli.effort,
         max_output_tokens: cli.max_output_tokens,
         logprobs: cli.logprobs,
-        idle_timeout: Duration::from_secs(300),
+        idle_timeout: Duration::from_secs(60 * 60),
         max_attempts: 5,
     })?;
     let beam_pool = PoolConfig {
@@ -203,12 +203,13 @@ async fn main() -> Result<()> {
             max_turns: cli.max_turns,
             cache_dir: cli.cache_dir,
             capture_requests: cli.capture_requests,
+            dont_give_up: cli.dont_give_up,
         },
         instructions: {
             let mut text =
                 prompt::instructions(&template, &cli.target, !cli.no_shell, &cli.beam_skill)?;
             if cli.dont_give_up {
-                // Only the prompt changes; --max-turns still applies.
+                // The loop also continues text-only replies; --max-turns still applies.
                 text.push_str("\n\nThis statement is definitely provable as stated. Do not give up and do not end the session without a verified submission: if one approach stalls, try another, split the hard claim among subagents, and keep going.\n");
             }
             text

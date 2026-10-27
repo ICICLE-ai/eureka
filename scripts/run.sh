@@ -13,8 +13,8 @@
 #   IMAGE                  sandbox image (default: beam-pool:local)
 #   POOL_ENDPOINT          pool gateway as the sandboxes see it (default: gateway:9000;
 #                          tapis-gateway:9000 for Tapis, see run-tapis.sh)
-#   RETRIEVAL=1            add the tools from setup-retrieval.sh (uses eureka-agent:local,
-#                          which is built on beam-pool:local, instead of IMAGE)
+#   RETRIEVAL=1            add the tools from setup-retrieval.sh; defaults IMAGE to
+#                          eureka-agent:local (a custom IMAGE must include the retrieval client)
 #   LOGPROBS=false         explicitly allow missing token probabilities (default: require them)
 # Requests, responses, reasoning and stream events are captured for every attempt.
 # Run `harness/target/debug/harness --help` for the other flags.
@@ -54,7 +54,7 @@ args=(
     --comparator "$ROOT/comparator" --beam-skill "$ROOT/lean-beam/skills/lean-beam"
 )
 if [ "${RETRIEVAL:-0}" = 1 ]; then
-    args+=(--image eureka-agent:local --mcp "$ROOT/tools/retrieval/mcp.json")
+    args+=(--image "${IMAGE:-eureka-agent:local}" --mcp "$ROOT/tools/retrieval/mcp.json")
 else
     args+=(--image "${IMAGE:-beam-pool:local}")
 fi

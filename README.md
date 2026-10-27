@@ -45,6 +45,10 @@ No chat template is added. The first token normally has no score. Missing scores
 Use the same model and pool environment settings as before. It enables `--dont-give-up` through `run.sh`.
 It defaults to `attempt-000001`; pass another attempt ID as the third argument to resume that one.
 
+Full contexts compact automatically. The prover writes a handoff and continues with the same files and tools.
+Each compaction saves its history, proof snapshot and summary under the attempt directory. Original instructions and verification stay fixed.
+`--dont-give-up` continues text-only replies. Use `MAX_TURNS=10000 scripts/run.sh ...` for longer runs. Compactions do not reset that limit or have a count limit.
+
 ## Setup
 
 You need Linux, Docker, Rust 1.91+, Python 3.10+, and Lean (installed with elan).
