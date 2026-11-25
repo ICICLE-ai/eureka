@@ -1,3 +1,5 @@
+# Canonical source: https://github.com/by-eureka/eureka
+# Project contributions: https://github.com/by-eureka/eureka/pulls
 # Upstream does not publish a project-wide license.
 - id: "Eureka:0.1.0"
   owner: "Debargha Ganguly"

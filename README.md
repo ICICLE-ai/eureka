@@ -5,6 +5,8 @@ Eureka runs open-weight models on Lean theorem-proving tasks in a sandbox. Lean 
 
 **Tags:** CI4AI
 
+> This ICICLE fork tracks [`by-eureka/eureka`](https://github.com/by-eureka/eureka). Send code contributions to [upstream pull requests](https://github.com/by-eureka/eureka/pulls) and report bugs or feature requests in [upstream issues](https://github.com/by-eureka/eureka/issues).
+
 ### License
 
 The upstream repository has no license for the project as a whole. Its [vendored Codex](third_party/codex/LICENSE) and [retrieval service](tools/retrieval/LICENSE) have separate license files.
