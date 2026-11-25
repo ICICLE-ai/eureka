@@ -1,5 +1,33 @@
 # Eureka
 
+<!-- ICICLE metadata start -->
+Eureka runs open-weight models on Lean theorem-proving tasks in a sandbox. Lean Beam supports interactive proof development, and Comparator verifies candidate proofs.
+
+**Tags:** CI4AI
+
+### License
+
+The upstream repository has no license for the project as a whole. Its [vendored Codex](third_party/codex/LICENSE) and [retrieval service](tools/retrieval/LICENSE) have separate license files.
+
+## References
+
+- [Eureka project site](https://by-eureka.org)
+- [Harness deployment guide](harness/deploy/README.md)
+- [Upstream repository](https://github.com/by-eureka/eureka)
+
+## Acknowledgements
+
+*National Science Foundation (NSF) funded AI institute for Intelligent Cyberinfrastructure with Computational Learning in the Environment (ICICLE) (OAC 2112606)*
+
+## Issue reporting
+
+Report issues on [GitHub](https://github.com/by-eureka/eureka/issues).
+
+---
+
+# How-To Guides
+<!-- ICICLE metadata end -->
+
 In development.
 
 ## Quick start

@@ -1,0 +1,16 @@
+# Upstream does not publish a project-wide license.
+- id: "Eureka:0.1.0"
+  owner: "Debargha Ganguly"
+  primaryThrust: "core/CI4AI"
+  name: "Eureka"
+  status: "PrototypeRelease"
+  description: "Eureka runs open-weight models on Lean theorem-proving tasks in a sandbox. Lean Beam supports interactive proof development, and Comparator verifies candidate proofs."
+  componentVersion: "0.1.0"
+  targetIcicleRelease: None
+  licenseUrl: ""
+  publicAccess: true
+  sourceCodeUrl: "https://github.com/ICICLE-ai/eureka"
+  codeReviewConducted: true
+  testsWritten: true
+  developerDocumentationAvailable: true
+  trainingTutorialsAvailable: false
